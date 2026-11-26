@@ -65,10 +65,11 @@ class BaseEmbeddingWidgetView:
         self.components.label(bottom_frame, 0, 0, "train:")
         self.components.switch(bottom_frame, 0, 1, self.ui_state, "train", command=save_command, width=40)
 
-        # output embedding
-        self.components.label(bottom_frame, 0, 2, "output embedding:",
-                              tooltip="Output embeddings are calculated at the output of the text encoder, not the input. This can improve results for larger text encoders and lower VRAM usage.")
-        self.components.switch(bottom_frame, 0, 3, self.ui_state, "is_output_embedding", width=40)
+        # output embedding (hidden for models without an output embedding, e.g. Moss)
+        if self._should_show_output_embedding_toggle(controller):
+            self.components.label(bottom_frame, 0, 2, "output embedding:",
+                                  tooltip="Output embeddings are calculated at the output of the text encoder, not the input. This can improve results for larger text encoders and lower VRAM usage.")
+            self.components.switch(bottom_frame, 0, 3, self.ui_state, "is_output_embedding", width=40)
 
         # stop training after
         self.components.label(bottom_frame, 0, 4, "stop training after:",
@@ -102,6 +103,9 @@ class AdditionalEmbeddingsTabView(ConfigListView, BaseAdditionalEmbeddingsTabVie
 
 
 class EmbeddingWidgetView(BaseEmbeddingWidgetView, QWidget):
+
+    def _should_show_output_embedding_toggle(self, controller) -> bool:
+        return not controller.train_config.model_type.is_moss()
 
     def __init__(self, master, element, i, open_command, remove_command, clone_command, save_command, controller):
         QWidget.__init__(self, master)
