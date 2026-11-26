@@ -32,6 +32,7 @@ from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.profiling_util import PeakMemoryRecorder, TorchMemoryRecorder, TorchProfiler
+from modules.util.slider_util import compute_slider_diff_weight, warn_if_mixed_slider_concepts
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.tqdm_util import tqdm
@@ -87,10 +88,16 @@ class GenericTrainer(BaseTrainer):
         self.grad_hook_handles = []
         self.__early_stopping_loss: float | None = None
         self.__early_stopping_epoch = 0
+        self.__suppress_fused_back_pass = False
 
     def start(self):
         if self.config.validation:
             self.config.parse_validation_timesteps()
+
+        concepts = self.config.load_concepts()
+        warn_if_mixed_slider_concepts(concepts)
+        if self.config.has_slider_concepts() and self.config.training_method != TrainingMethod.LORA:
+            raise ValueError("Slider concepts require Training Method to be LORA.")
 
         if multi.is_master():
             self.__save_config_to_workspace()
@@ -271,14 +278,25 @@ class GenericTrainer(BaseTrainer):
             if jobs:
                 self.model.eval()
 
-                sampler_outputs = self.model_sampler.sample_all(
-                    [sample_config for sample_config, _, _, _ in jobs],
-                    [destination for _, destination, _, _ in jobs],
-                    self.config.sample_image_format,
-                    self.config.sample_video_format,
-                    self.config.sample_audio_format,
-                    on_update_progress=on_update_progress,
-                )
+                if self.config.has_slider_concepts():
+                    sampler_outputs = self.model_sampler.sample_slider_all(
+                        [sample_config for sample_config, _, _, _ in jobs],
+                        [destination for _, destination, _, _ in jobs],
+                        self.config.sample_image_format,
+                        self.config.sample_video_format,
+                        self.config.sample_audio_format,
+                        multipliers=(-1.0, 1.0),
+                        on_update_progress=on_update_progress,
+                    )
+                else:
+                    sampler_outputs = self.model_sampler.sample_all(
+                        [sample_config for sample_config, _, _, _ in jobs],
+                        [destination for _, destination, _, _ in jobs],
+                        self.config.sample_image_format,
+                        self.config.sample_video_format,
+                        self.config.sample_audio_format,
+                        on_update_progress=on_update_progress,
+                    )
 
                 for (_, _, i, prompt_label), sampler_output in zip(jobs, sampler_outputs, strict=True):
                     if is_custom_sample:
@@ -647,7 +665,7 @@ class GenericTrainer(BaseTrainer):
 
                     def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
                         init_compile()  # workaround for https://github.com/pytorch/pytorch/issues/186537
-                        if self.__is_update_step(self.model.train_progress):
+                        if not self.__suppress_fused_back_pass and self.__is_update_step(self.model.train_progress):
                             if fused_reduce:
                                 multi.reduce_grads_mean(
                                     [tensor],
@@ -824,30 +842,141 @@ class GenericTrainer(BaseTrainer):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
 
-                    prior_pred_indices = [i for i in range(self.config.batch_size)
-                                          if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
-                    if len(prior_pred_indices) > 0 \
-                            or (self.config.masked_training
-                                and self.config.masked_prior_preservation_weight > 0
-                                and self.config.training_method == TrainingMethod.LORA):
-                        with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
-                            #do NOT create a subbatch using the indices, even though it would be more efficient:
-                            #different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
-                            prior_model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                        model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                        prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
-                        model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
-                        model_output_data['prior_target'] = prior_model_prediction
-                    else:
-                        model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                    batch_len = len(batch['concept_type'])
+                    slider_indices = [i for i in range(batch_len)
+                                      if ConceptType(batch['concept_type'][i]) == ConceptType.SLIDER]
+                    if len(slider_indices) == 0:
+                        prior_pred_indices = [i for i in range(batch_len)
+                                              if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
+                        if len(prior_pred_indices) > 0 \
+                                or (self.config.masked_training
+                                    and self.config.masked_prior_preservation_weight > 0
+                                    and self.config.training_method == TrainingMethod.LORA):
+                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                                #do NOT create a subbatch using the indices, even though it would be more efficient:
+                                #different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
+                                prior_model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                            prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
+                            model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
+                            model_output_data['prior_target'] = prior_model_prediction
+                        else:
+                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                        loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
-                    loss = loss / self.config.gradient_accumulation_steps
-                    if scaler:
-                        scaler.scale(loss).backward()
+                        loss = loss / self.config.gradient_accumulation_steps
+                        if scaler:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                    elif len(slider_indices) == batch_len:
+                        if self.config.training_method != TrainingMethod.LORA:
+                            raise ValueError("Slider concepts require Training Method to be LORA.")
+                        slider_weight = compute_slider_diff_weight(
+                            self.model,
+                            batch['latent_image'],
+                            batch['negative_latent_image'],
+                            self.config.slider_diff_weight,
+                        )
+                        pos_batch = {**batch, 'slider_weight': slider_weight}
+                        neg_batch = {
+                            **batch,
+                            'latent_image': batch['negative_latent_image'],
+                            'negative_latent_image': batch['latent_image'],
+                            'slider_weight': slider_weight,
+                        }
+                        try:
+                            self.__suppress_fused_back_pass = True
+                            self.model.set_adapter_multiplier(1.0)
+                            pos_output = self.model_setup.predict(self.model, pos_batch, self.config, train_progress)
+                            pos_loss = self.model_setup.calculate_loss(self.model, pos_batch, pos_output, self.config)
+                            scaled_pos_loss = (0.5 * pos_loss) / self.config.gradient_accumulation_steps
+                            if scaler:
+                                scaler.scale(scaled_pos_loss).backward()
+                            else:
+                                scaled_pos_loss.backward()
+
+                            self.__suppress_fused_back_pass = False
+                            self.model.set_adapter_multiplier(-1.0)
+                            neg_output = self.model_setup.predict(self.model, neg_batch, self.config, train_progress)
+                            neg_loss = self.model_setup.calculate_loss(self.model, neg_batch, neg_output, self.config)
+                            scaled_neg_loss = (0.5 * neg_loss) / self.config.gradient_accumulation_steps
+                            if scaler:
+                                scaler.scale(scaled_neg_loss).backward()
+                            else:
+                                scaled_neg_loss.backward()
+                        finally:
+                            self.__suppress_fused_back_pass = False
+                            self.model.set_adapter_multiplier(1.0)
+
+                        loss = (0.5 * pos_loss.detach() + 0.5 * neg_loss.detach()) / self.config.gradient_accumulation_steps
                     else:
-                        loss.backward()
+                        if self.config.training_method != TrainingMethod.LORA:
+                            raise ValueError("Slider concepts require Training Method to be LORA.")
+                        non_slider_indices = [i for i in range(batch_len) if i not in slider_indices]
+                        loss = torch.tensor(0.0, device=train_device)
+                        try:
+                            self.__suppress_fused_back_pass = True
+                            if non_slider_indices:
+                                non_slider_batch = self.__slice_sub_batch(batch, non_slider_indices, batch_len)
+                                non_slider_weight = len(non_slider_indices) / batch_len
+                                non_slider_output = self.model_setup.predict(
+                                    self.model, non_slider_batch, self.config, train_progress
+                                )
+                                non_slider_loss = self.model_setup.calculate_loss(
+                                    self.model, non_slider_batch, non_slider_output, self.config
+                                )
+                                scaled_non_slider = (non_slider_loss * non_slider_weight) / self.config.gradient_accumulation_steps
+                                if scaler:
+                                    scaler.scale(scaled_non_slider).backward()
+                                else:
+                                    scaled_non_slider.backward()
+                                loss = loss + scaled_non_slider.detach()
+
+                            slider_batch = self.__slice_sub_batch(batch, slider_indices, batch_len)
+                            neg_latents = slider_batch['negative_latent_image']
+                            if isinstance(neg_latents, list):
+                                neg_latents = torch.stack(neg_latents)
+                                slider_batch['negative_latent_image'] = neg_latents
+                            slider_weight = compute_slider_diff_weight(
+                                self.model,
+                                slider_batch['latent_image'],
+                                neg_latents,
+                                self.config.slider_diff_weight,
+                            )
+                            pos_sub = {**slider_batch, 'slider_weight': slider_weight}
+                            neg_sub = {
+                                **slider_batch,
+                                'latent_image': neg_latents,
+                                'negative_latent_image': slider_batch['latent_image'],
+                                'slider_weight': slider_weight,
+                            }
+                            pole_weight = (0.5 * len(slider_indices)) / batch_len
+
+                            self.model.set_adapter_multiplier(1.0)
+                            pos_output = self.model_setup.predict(self.model, pos_sub, self.config, train_progress)
+                            pos_loss = self.model_setup.calculate_loss(self.model, pos_sub, pos_output, self.config)
+                            scaled_pos = (pos_loss * pole_weight) / self.config.gradient_accumulation_steps
+                            if scaler:
+                                scaler.scale(scaled_pos).backward()
+                            else:
+                                scaled_pos.backward()
+
+                            self.__suppress_fused_back_pass = False
+                            self.model.set_adapter_multiplier(-1.0)
+                            neg_output = self.model_setup.predict(self.model, neg_sub, self.config, train_progress)
+                            neg_loss = self.model_setup.calculate_loss(self.model, neg_sub, neg_output, self.config)
+                            scaled_neg = (neg_loss * pole_weight) / self.config.gradient_accumulation_steps
+                            if scaler:
+                                scaler.scale(scaled_neg).backward()
+                            else:
+                                scaled_neg.backward()
+
+                            loss = loss + scaled_pos.detach() + scaled_neg.detach()
+                        finally:
+                            self.__suppress_fused_back_pass = False
+                            self.model.set_adapter_multiplier(1.0)
 
                     has_gradient = True
                     detached_loss = loss.detach()
@@ -968,3 +1097,25 @@ class GenericTrainer(BaseTrainer):
 
         for handle in self.grad_hook_handles:
             handle.remove()
+
+    @staticmethod
+    def __slice_sub_batch(batch: dict, indices: list[int], batch_size: int) -> dict:
+        sub_batch = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim > 0 and value.shape[0] == batch_size:
+                    sub_batch[key] = value[indices]
+                else:
+                    sub_batch[key] = value
+            elif isinstance(value, (list, tuple)):
+                if len(value) > 0 and all(
+                        isinstance(v, torch.Tensor) and v.ndim == 1 and v.shape[0] == batch_size for v in value
+                ):
+                    sub_batch[key] = type(value)(v[indices] for v in value)
+                elif len(value) == batch_size:
+                    sub_batch[key] = type(value)(value[i] for i in indices)
+                else:
+                    sub_batch[key] = value
+            else:
+                sub_batch[key] = value
+        return sub_batch

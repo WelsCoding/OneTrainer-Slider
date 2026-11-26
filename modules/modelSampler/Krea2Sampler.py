@@ -107,25 +107,29 @@ class Krea2Sampler(BaseModelSampler):
         if "generator" in set(inspect.signature(noise_scheduler.step).parameters.keys()):
             extra_step_kwargs["generator"] = generator
 
-        for i, timestep in enumerate(tqdm(timesteps, desc="steps", leave=False)):
-            latent_model_input = torch.cat([latent_image] * batch_size)
-            expanded_timestep = timestep.expand(batch_size)
-            noise_pred = transformer(
-                hidden_states=latent_model_input.to(dtype=self.model.train_dtype.torch_dtype()),
-                encoder_hidden_states=combined_prompt_embedding.to(dtype=self.model.train_dtype.torch_dtype()),
-                timestep=expanded_timestep / 1000,
-                position_ids=position_ids,
-                encoder_attention_mask=text_attention_mask,
-                return_dict=False,
-            )[0]
+        self.model.set_adapter_multiplier(getattr(sample_config, "slider_multiplier", 1.0))
+        try:
+            for i, timestep in enumerate(tqdm(timesteps, desc="steps", leave=False)):
+                latent_model_input = torch.cat([latent_image] * batch_size)
+                expanded_timestep = timestep.expand(batch_size)
+                noise_pred = transformer(
+                    hidden_states=latent_model_input.to(dtype=self.model.train_dtype.torch_dtype()),
+                    encoder_hidden_states=combined_prompt_embedding.to(dtype=self.model.train_dtype.torch_dtype()),
+                    timestep=expanded_timestep / 1000,
+                    position_ids=position_ids,
+                    encoder_attention_mask=text_attention_mask,
+                    return_dict=False,
+                )[0]
 
-            if cfg_scale > 1.0:
-                noise_pred_positive, noise_pred_negative = noise_pred.chunk(2)
-                noise_pred = noise_pred_negative + cfg_scale * (noise_pred_positive - noise_pred_negative)
+                if cfg_scale > 1.0:
+                    noise_pred_positive, noise_pred_negative = noise_pred.chunk(2)
+                    noise_pred = noise_pred_negative + cfg_scale * (noise_pred_positive - noise_pred_negative)
 
-            latent_image = noise_scheduler.step(noise_pred, timestep, latent_image, return_dict=False, **extra_step_kwargs)[0]
+                latent_image = noise_scheduler.step(noise_pred, timestep, latent_image, return_dict=False, **extra_step_kwargs)[0]
 
-            on_update_progress(i + 1, len(timesteps))
+                on_update_progress(i + 1, len(timesteps))
+        finally:
+            self.model.set_adapter_multiplier(1.0)
 
         latent_image = self.model.unpack_latents(
             latent_image,

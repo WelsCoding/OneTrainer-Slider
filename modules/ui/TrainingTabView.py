@@ -904,6 +904,13 @@ class BaseTrainingTabView(ABC):
         self.components.options(frame, row, 1, [str(x) for x in list(LossScaler)], ui_state, "loss_scaler")
         row += 1
 
+        # Slider Diff Weight
+        self.components.label(frame, row, 0, "Slider Diff Weight",
+                              tooltip="Spatial difference weighting for Slider LoRA pairs (0 = uniform across image, 1 = focus on latent differences between +1 and -1)")
+        self.components.entry(frame, row, 1, ui_state, "slider_diff_weight", max_width=5,
+                              extra_validate=check_range(lower=0, upper=1, message="Slider diff weight must be between 0 and 1"))
+        row += 1
+
     def __create_layer_frame(self, master, row, controller, ui_state):
         presets = controller.get_layer_presets()
         self.components.layer_filter_entry(master, row, 0, ui_state,

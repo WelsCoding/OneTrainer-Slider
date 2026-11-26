@@ -153,15 +153,27 @@ class SampleWindowController:
             self.model.eval()
 
             try:
-                self.model_sampler.sample(
-                    sample_config=sample,
-                    destination=sample_path,
-                    image_format=self.current_train_config.sample_image_format,
-                    video_format=self.current_train_config.sample_video_format,
-                    audio_format=self.current_train_config.sample_audio_format,
-                    on_sample=on_sample,
-                    on_update_progress=on_update_progress,
-                )
+                if self.current_train_config.has_slider_concepts():
+                    sampler_outputs = self.model_sampler.sample_slider_all(
+                        sample_configs=[sample],
+                        destinations=[sample_path],
+                        image_format=self.current_train_config.sample_image_format,
+                        video_format=self.current_train_config.sample_video_format,
+                        audio_format=self.current_train_config.sample_audio_format,
+                        on_update_progress=on_update_progress,
+                    )
+                    for sampler_output in sampler_outputs:
+                        on_sample(sampler_output)
+                else:
+                    self.model_sampler.sample(
+                        sample_config=sample,
+                        destination=sample_path,
+                        image_format=self.current_train_config.sample_image_format,
+                        video_format=self.current_train_config.sample_video_format,
+                        audio_format=self.current_train_config.sample_audio_format,
+                        on_sample=on_sample,
+                        on_update_progress=on_update_progress,
+                    )
             finally:
                 # the sampler materializes parts on demand; release VRAM now that this
                 # standalone sample window is idle again

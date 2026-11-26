@@ -20,10 +20,14 @@ from modules.util import create
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig, prepare_run_name
+from modules.util.enum.ConceptType import ConceptType
+from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.profiling_util import PeakMemoryRecorder
+from modules.util.slider_util import scan_slider_pairs, warn_if_mixed_slider_concepts
 from modules.util.tensorboard_util import TensorboardProcess
 from modules.util.torch_util import print_fragmentation, torch_gc
 from modules.util.TrainProgress import TrainProgress
+from modules.util.ui.autocorrect import is_huggingface_repo_or_file
 from modules.util.ui.validation import flush_and_validate_all
 
 import torch
@@ -335,6 +339,38 @@ class TrainUIController:
                 available, reason = get_multi_gpu_availability(self._local_gpu_count, self.train_config.cloud.enabled)
                 if not available:
                     errors.append(f"Multi-GPU: {reason}")
+
+            concepts = self.train_config.load_concepts()
+            warn_if_mixed_slider_concepts(concepts)
+            slider_concepts = [
+                c for c in concepts if getattr(c, 'enabled', True) and ConceptType(c.type) == ConceptType.SLIDER
+            ]
+            if slider_concepts:
+                if self.train_config.training_method != TrainingMethod.LORA:
+                    errors.append("Slider concepts require Training Method to be LORA.")
+                for concept in slider_concepts:
+                    label = concept.name or concept.path or "(unnamed)"
+                    if not concept.path:
+                        errors.append(f"Slider concept '{label}': Positive Path (+1) is empty.")
+                    if not concept.negative_path:
+                        errors.append(f"Slider concept '{label}': Negative Path (-1) is empty.")
+                    elif (
+                        not is_huggingface_repo_or_file(concept.path)
+                        and not is_huggingface_repo_or_file(concept.negative_path)
+                        and os.path.isdir(concept.path)
+                        and os.path.isdir(concept.negative_path)
+                    ):
+                        scan = scan_slider_pairs(
+                            concept.path,
+                            concept.negative_path,
+                            include_subdirectories=concept.include_subdirectories,
+                            check_dimensions=True,
+                        )
+                        if scan.matching_pairs_count == 0:
+                            errors.append(
+                                f"Slider concept '{label}': No matching pairs with equal dimensions found between +1 and -1 folders."
+                            )
+
             if errors:
                 self.view.show_validation_errors(errors)
                 return

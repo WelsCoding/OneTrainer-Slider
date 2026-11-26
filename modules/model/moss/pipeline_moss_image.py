@@ -62,10 +62,27 @@ from accelerate import init_empty_weights
 
 def _convert_moss_image_transformer_checkpoint(checkpoint):
     """Map a single-file MOSSImage transformer checkpoint onto the model's state-dict layout."""
-    converted = {}
+    # Strip ComfyUI / wrapper prefixes before key matching.
+    prefixes = ("model.diffusion_model.", "diffusion_model.")
+    stripped = {}
     for key, value in checkpoint.items():
+        if key.endswith(".comfy_attention.config"):
+            continue
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                break
+        stripped[key] = value
+
+    converted = {}
+    for key, value in stripped.items():
         if key.startswith('layers.') and key.endswith('.proj.qkv.weight'):
             q, k, v = value.chunk(3, dim=0)
+            if hasattr(value, "quant_type"):
+                cls = type(value)
+                q = cls(q, quant_type=value.quant_type)
+                k = cls(k, quant_type=value.quant_type)
+                v = cls(v, quant_type=value.quant_type)
             base = key[: -len('.qkv.weight')]
             converted[base + '.q.weight'] = q
             converted[base + '.k.weight'] = k

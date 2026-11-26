@@ -37,8 +37,11 @@ class PeftBase(nn.Module):
         self.is_applied = False
         self.layer_kwargs = {}
         self._initialized = False
+        self.register_buffer("multiplier", torch.tensor(1.0), persistent=False)
+        self.multiplier.requires_grad_(False)
 
         if orig_module is not None:
+            self.multiplier = self.multiplier.to(orig_module.weight.device)
             match orig_module:
                 case nn.Linear():
                     self.op = F.linear
@@ -121,6 +124,9 @@ class PeftBase(nn.Module):
         # start/end are the leaf's row range in the fused output. Returns None (the default) when no
         # such path exists, and the caller falls back to delta_forward.
         return None
+
+    def set_multiplier(self, multiplier: float):
+        self.multiplier.fill_(multiplier)
 
     @property
     def orig_module(self) -> nn.Module:
@@ -293,7 +299,7 @@ class LoHaModule(PeftBase):
                               self.dropout(self.hada_w1_a))
         W2 = self.make_weight(self.dropout(self.hada_w2_b),
                               self.dropout(self.hada_w2_a))
-        W = (W1 * W2) * (self.alpha / self.rank)
+        W = (W1 * W2) * ((self.alpha * self.multiplier) / self.rank)
         return self.op(x, W, bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
@@ -482,7 +488,7 @@ class LoKrModule(PeftBase):
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
 
-        scale = self.alpha / self.dim
+        scale = (self.alpha * self.multiplier) / self.dim
 
         # DoRA for LoKr
         if self.weight_decompose:
@@ -578,7 +584,9 @@ class LoRAModule(PeftBase):
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
         if isinstance(self.orig_module, LoRAFusableLinearMixin):
-            return self.orig_module.forward_with_lora(x, self.lora_down.weight, self.lora_up.weight, self.dropout, self.alpha)
+            return self.orig_module.forward_with_lora(
+                x, self.lora_down.weight, self.lora_up.weight, self.dropout, self.alpha * self.multiplier
+            )
 
         return self.orig_forward(x) + self.delta_forward(x, *args, **kwargs)
 
@@ -587,12 +595,14 @@ class LoRAModule(PeftBase):
         if not isinstance(leaf, LoRAFusableLinearMixin):
             return None
         #the fused adapter's up spans all leaves' concatenated outputs; narrow it to this leaf's rows
-        return leaf.forward_with_lora(x, self.lora_down.weight, self.lora_up.weight[start:end], self.dropout, self.alpha)
+        return leaf.forward_with_lora(
+            x, self.lora_down.weight, self.lora_up.weight[start:end], self.dropout, self.alpha * self.multiplier
+        )
 
     def delta_forward(self, x, *args, **kwargs) -> Tensor | None:
         self.check_initialized()
         ld = self.lora_up(self.dropout(self.lora_down(x)))
-        return ld * (self.alpha / self.rank)
+        return ld * ((self.alpha * self.multiplier) / self.rank)
 
     def apply_to_module(self):
         # TODO
@@ -711,11 +721,11 @@ class OFTModule(PeftBase):
 
         # For Linear layers, rotating the input is mathematically equivalent to rotating the weights.
         if isinstance(self.orig_module, nn.Linear):
-            rotated_x = self.oft_R(x)
+            rotated_x = self.oft_R(x, multiplier=self.multiplier)
             return self.orig_forward(rotated_x, *args, **kwargs)
 
         scaling_factor = 2 * math.sqrt(self.oft_R.block_size - 1) if self.oft_scaled else 1
-        effective_weight = self.oft_R.weight / scaling_factor
+        effective_weight = (self.oft_R.weight * self.multiplier.to(self.oft_R.weight.dtype)) / scaling_factor
 
         # For Conv2d, we must rotate the weights, not the input, to preserve spatial information.
         orth_rotate = self.oft_R._cayley_batch(
@@ -798,7 +808,9 @@ class DoRAOFTModule(OFTModule):
         result = super().forward(self.dropout(x), *args, **kwargs)
 
         # Apply Exponential DoRA Scale (exp(0) = Multiplies by 1.0 at step 0)
-        multiplier = torch.exp(self.dora_log_multiplier).to(result.dtype)
+        multiplier = torch.exp(
+            self.dora_log_multiplier * self.multiplier.to(self.dora_log_multiplier.dtype)
+        ).to(result.dtype)
         if isinstance(self.orig_module, nn.Conv2d):
             # Broadcast over spatial dimensions for both batched and unbatched inputs.
             multiplier = multiplier.view(-1, 1, 1)
@@ -896,7 +908,7 @@ class DoRAModule(LoRAModule):
             assert isinstance(self.orig_module, nn.Conv2d)
             orig_weight = self.orig_module.weight.detach().float()
 
-        WP = orig_weight + (self.make_weight(A, B) * (self.alpha / self.rank))
+        WP = orig_weight + (self.make_weight(A, B) * ((self.alpha * self.multiplier) / self.rank))
         del orig_weight
         # A norm should never really end up zero at any point, but epsilon just
         # to be safe if we underflow or something. Also, as per section 4.3 of
@@ -1246,3 +1258,10 @@ class LoRAModuleWrapper:
             raise ValueError("Dropout probability must be in [0, 1]")
         for module in self.lora_modules.values():
             module.dropout.p = dropout_probability
+
+    def set_multiplier(self, multiplier: float):
+        """
+        Sets the adapter forward multiplier for all wrapped modules
+        """
+        for module in self.lora_modules.values():
+            module.set_multiplier(multiplier)

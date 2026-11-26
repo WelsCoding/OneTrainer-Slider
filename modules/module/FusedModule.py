@@ -174,6 +174,9 @@ class FusedModuleGroup:
     def requires_grad_(self, requires_grad: bool):
         self.module.requires_grad_(requires_grad)
 
+    def set_multiplier(self, multiplier: float):
+        self.module.set_multiplier(multiplier)
+
     @property
     def dropout(self):
         return self.module.dropout

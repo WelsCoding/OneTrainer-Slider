@@ -13,6 +13,7 @@ from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.AudioFormat import AudioFormat
+from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
@@ -665,6 +666,7 @@ class TrainConfig(BaseConfig):
     lora_decompose_output_axis: bool
     lora_weight_dtype: DataType
     bundle_additional_embeddings: bool
+    slider_diff_weight: float
 
     # oft
     oft_block_size: int
@@ -1136,6 +1138,20 @@ class TrainConfig(BaseConfig):
         else:
             return self.additional_embeddings
 
+    def load_concepts(self) -> list[ConceptConfig]:
+        if self.concepts is not None:
+            return self.concepts
+        if self.concept_file_name and os.path.isfile(self.concept_file_name):
+            with open(self.concept_file_name, 'r') as f:
+                return [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
+        return []
+
+    def has_slider_concepts(self) -> bool:
+        return any(
+            getattr(c, 'enabled', True) and ConceptType(c.type) == ConceptType.SLIDER
+            for c in self.load_concepts()
+        )
+
     def parse_validation_timesteps(self) -> list[int]:
         return parse_validation_timesteps(self.validation_timesteps)
 
@@ -1458,6 +1474,7 @@ class TrainConfig(BaseConfig):
         data.append(("lora_decompose_output_axis", False, bool, False))
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("bundle_additional_embeddings", True, bool, False))
+        data.append(("slider_diff_weight", 1.0, float, False))
 
         # oft
         data.append(("oft_block_size", 32, int, False))

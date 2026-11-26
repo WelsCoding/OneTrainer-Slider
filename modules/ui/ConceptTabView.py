@@ -23,7 +23,7 @@ from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QLineEdit, QPushBu
 
 class BaseConceptTabView(BaseConfigListView):
 
-    _FILTER_TYPES = ["ALL", "STANDARD", "VALIDATION", "PRIOR_PREDICTION"]
+    _FILTER_TYPES = ["ALL", "STANDARD", "VALIDATION", "PRIOR_PREDICTION", "SLIDER"]
 
     def _element_matches_filters(self, element):
         if not self.filters.get("show_disabled", True):

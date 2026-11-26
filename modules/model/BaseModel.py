@@ -266,6 +266,10 @@ class BaseModel(ModelCaptionDropoutMixin, metaclass=ABCMeta):
                 result.append(lora)
         return result
 
+    def set_adapter_multiplier(self, multiplier: float):
+        for adapter in self.adapters():
+            adapter.set_multiplier(multiplier)
+
     def diffusers_to_original(self) -> list | None:
         # the canonical(diffusers) -> native key-conversion BODY (rename only) for this model's denoising
         # component. The single per-model definition, overridden by each model, reused by the four per-format

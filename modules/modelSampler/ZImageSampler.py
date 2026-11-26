@@ -93,28 +93,32 @@ class ZImageSampler(BaseModelSampler):
         if "generator" in set(inspect.signature(noise_scheduler.step).parameters.keys()):
             extra_step_kwargs["generator"] = generator
 
-        for i, timestep in enumerate(tqdm(timesteps, desc="steps", leave=False)):
-            latent_model_input = latent_image.unsqueeze(2).to(dtype=self.model.train_dtype.torch_dtype())
-            latent_model_input = torch.cat([latent_model_input] * batch_size)
-            latent_model_input_list = list(latent_model_input.unbind(dim=0))
-            timestep_model_input = timestep.unsqueeze(0)
-            assert timestep_model_input.ndim ==  1
-            output_list = transformer(
-                latent_model_input_list,
-                (1000 - timestep_model_input) / 1000,
-                prompt_embedding,
-                return_dict=True
-            ).sample
+        self.model.set_adapter_multiplier(getattr(sample_config, "slider_multiplier", 1.0))
+        try:
+            for i, timestep in enumerate(tqdm(timesteps, desc="steps", leave=False)):
+                latent_model_input = latent_image.unsqueeze(2).to(dtype=self.model.train_dtype.torch_dtype())
+                latent_model_input = torch.cat([latent_model_input] * batch_size)
+                latent_model_input_list = list(latent_model_input.unbind(dim=0))
+                timestep_model_input = timestep.unsqueeze(0)
+                assert timestep_model_input.ndim ==  1
+                output_list = transformer(
+                    latent_model_input_list,
+                    (1000 - timestep_model_input) / 1000,
+                    prompt_embedding,
+                    return_dict=True
+                ).sample
 
-            noise_pred = - torch.stack(output_list, dim=0).squeeze(dim=2)
+                noise_pred = - torch.stack(output_list, dim=0).squeeze(dim=2)
 
-            if cfg_scale > 1.0:
-                noise_pred_positive, noise_pred_negative = noise_pred.chunk(2)
-                noise_pred = noise_pred_negative + cfg_scale * (noise_pred_positive - noise_pred_negative)
+                if cfg_scale > 1.0:
+                    noise_pred_positive, noise_pred_negative = noise_pred.chunk(2)
+                    noise_pred = noise_pred_negative + cfg_scale * (noise_pred_positive - noise_pred_negative)
 
-            latent_image = noise_scheduler.step(noise_pred, timestep, latent_image, return_dict=False, **extra_step_kwargs)[0]
+                latent_image = noise_scheduler.step(noise_pred, timestep, latent_image, return_dict=False, **extra_step_kwargs)[0]
 
-            on_update_progress(i + 1, len(timesteps))
+                on_update_progress(i + 1, len(timesteps))
+        finally:
+            self.model.set_adapter_multiplier(1.0)
 
         return {
             "latent_image": latent_image,

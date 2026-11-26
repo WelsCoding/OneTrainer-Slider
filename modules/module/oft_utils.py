@@ -166,7 +166,7 @@ class OFTRotationModule(nn.Module):
 
         return R.to(previous_dtype)
 
-    def forward(self, x):
+    def forward(self, x, multiplier: torch.Tensor | None = None):
         required_dtype = x.dtype
         if required_dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
@@ -175,6 +175,8 @@ class OFTRotationModule(nn.Module):
 
         scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
         effective_weight = self.weight / scaling_factor
+        if multiplier is not None:
+            effective_weight = effective_weight * multiplier.to(effective_weight.dtype)
 
         orth_rotate = self._cayley_batch(
             effective_weight, self.block_size, self.use_cayley_neumann, self.use_matrix_exp

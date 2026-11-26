@@ -96,7 +96,10 @@ class MossModelLoader(
             vae_model_name: str,
             quantization: QuantizationConfig,
     ):
-        raise NotImplementedError("Loading of single file MOSS transformer not supported. Use the diffusers model instead.")
+        raise NotImplementedError(
+            "Loading of single file MOSS models not supported. Use the diffusers model instead. "
+            "Optionally, transformer-only safetensor files can be loaded by overriding the transformer."
+        )
 
     def load(
             self,

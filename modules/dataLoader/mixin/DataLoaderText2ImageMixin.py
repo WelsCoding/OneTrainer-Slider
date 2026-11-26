@@ -5,6 +5,20 @@ from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
 from modules.dataLoader.DropTags import DropTags
+from modules.dataLoader.SliderDataModules import (
+    CollectSliderPaths,
+    OptionalEncodeVAE,
+    OptionalEncodeWuerstchenEffnet,
+    OptionalImageToVideo,
+    OptionalLoadImage,
+    OptionalLoadVideo,
+    OptionalNormalizeImageChannels,
+    OptionalRescaleImageChannels,
+    OptionalSampleVAEDistribution,
+    OptionalScaleImage,
+    VerboseDiskCache,
+)
+from modules.dataLoader.wuerstchen.EncodeWuerstchenEffnet import EncodeWuerstchenEffnet
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
@@ -22,6 +36,7 @@ from mgds.pipelineModules.CollectPaths import CollectPaths
 from mgds.pipelineModules.DiskCache import DiskCache
 from mgds.pipelineModules.DistributedSampler import DistributedSampler
 from mgds.pipelineModules.DownloadHuggingfaceDatasets import DownloadHuggingfaceDatasets
+from mgds.pipelineModules.EncodeVAE import EncodeVAE
 from mgds.pipelineModules.GenerateImageLike import GenerateImageLike
 from mgds.pipelineModules.GenerateMaskedConditioningImage import GenerateMaskedConditioningImage
 from mgds.pipelineModules.GetFilename import GetFilename
@@ -32,6 +47,7 @@ from mgds.pipelineModules.LoadImage import LoadImage
 from mgds.pipelineModules.LoadMultipleTexts import LoadMultipleTexts
 from mgds.pipelineModules.LoadVideo import LoadVideo
 from mgds.pipelineModules.ModifyPath import ModifyPath
+from mgds.pipelineModules.NormalizeImageChannels import NormalizeImageChannels
 from mgds.pipelineModules.RandomBrightness import RandomBrightness
 from mgds.pipelineModules.RandomCircularMaskShrink import RandomCircularMaskShrink
 from mgds.pipelineModules.RandomContrast import RandomContrast
@@ -41,7 +57,10 @@ from mgds.pipelineModules.RandomLatentMaskRemove import RandomLatentMaskRemove
 from mgds.pipelineModules.RandomMaskRotateCrop import RandomMaskRotateCrop
 from mgds.pipelineModules.RandomRotate import RandomRotate
 from mgds.pipelineModules.RandomSaturation import RandomSaturation
+from mgds.pipelineModules.RescaleImageChannels import RescaleImageChannels
+from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
 from mgds.pipelineModules.ScaleCropImage import ScaleCropImage
+from mgds.pipelineModules.ScaleImage import ScaleImage
 from mgds.pipelineModules.SelectFirstInput import SelectFirstInput
 from mgds.pipelineModules.SelectInput import SelectInput
 from mgds.pipelineModules.SelectRandomText import SelectRandomText
@@ -67,17 +86,34 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             concept_out_name='concept',
         )
 
-        collect_paths = CollectPaths(
-            concept_in_name='concept', path_in_name='path', include_subdirectories_in_name='concept.include_subdirectories', enabled_in_name='enabled',
-            path_out_name='image_path', concept_out_name='concept',
-            extensions=supported_extensions, include_postfix=None, exclude_postfix=['-masklabel','-condlabel']
-        )
+        if getattr(self, '_has_slider_concepts', False):
+            download_negative_datasets = DownloadHuggingfaceDatasets(
+                concept_in_name='concept', path_in_name='negative_path', enabled_in_name='enabled',
+                concept_out_name='concept',
+            )
+            collect_paths = CollectSliderPaths(
+                concept_in_name='concept', path_in_name='path', neg_path_in_name='negative_path',
+                type_in_name='type', include_subdirectories_in_name='concept.include_subdirectories',
+                enabled_in_name='enabled', path_out_name='image_path', neg_path_out_name='negative_image_path',
+                concept_out_name='concept', extensions=supported_extensions,
+                include_postfix=None, exclude_postfix=['-masklabel', '-condlabel'],
+            )
+        else:
+            download_negative_datasets = None
+            collect_paths = CollectPaths(
+                concept_in_name='concept', path_in_name='path', include_subdirectories_in_name='concept.include_subdirectories', enabled_in_name='enabled',
+                path_out_name='image_path', concept_out_name='concept',
+                extensions=supported_extensions, include_postfix=None, exclude_postfix=['-masklabel','-condlabel']
+            )
 
         mask_path = ModifyPath(in_name='image_path', out_name='mask_path', postfix='-masklabel', extension='.png')
         cond_path = ModifyPath(in_name='image_path', out_name='cond_path', postfix='-condlabel', extension='.png')
         sample_prompt_path = ModifyPath(in_name='image_path', out_name='sample_prompt_path', postfix='', extension='.txt')
 
-        modules = [download_datasets, collect_paths, sample_prompt_path]
+        modules = [download_datasets]
+        if download_negative_datasets is not None:
+            modules.append(download_negative_datasets)
+        modules.extend([collect_paths, sample_prompt_path])
 
         if config.masked_training:
             modules.append(mask_path)
@@ -116,6 +152,31 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if vae_frame_dim:
             modules.append(image_to_video)
+
+        if getattr(self, '_has_slider_concepts', False):
+            load_negative_image = OptionalLoadImage(
+                path_in_name='negative_image_path',
+                image_out_name='negative_image',
+                range_min=0,
+                range_max=1,
+                supported_extensions=path_util.supported_image_extensions(),
+                dtype=train_dtype.torch_dtype(),
+                skip_corrupt=config.skip_corrupt_images,
+            )
+            load_negative_video = OptionalLoadVideo(
+                path_in_name='negative_image_path',
+                target_frame_count_in_name='settings.target_frames',
+                video_out_name='negative_image',
+                range_min=0,
+                range_max=1,
+                target_frame_rate=24,
+                supported_extensions=path_util.supported_video_extensions(),
+                dtype=train_dtype.torch_dtype(),
+            )
+            modules.append(load_negative_image)
+            modules.append(load_negative_video)
+            if vae_frame_dim:
+                modules.append(OptionalImageToVideo(in_name='negative_image', out_name='negative_image'))
 
         modules.extend([load_sample_prompts, load_concept_prompts, filename_prompt, select_prompt_input, select_random_text])
 
@@ -187,6 +248,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
     def _crop_modules(self, config: TrainConfig):
         inputs = ['image']
+
+        if getattr(self, '_has_slider_concepts', False):
+            inputs.append('negative_image')
 
         if config.masked_training or config.model_type.has_mask_input():
             inputs.append('mask')
@@ -277,6 +341,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 model.eval()
             before_cache_image_fun = prepare_vae
 
+        output_names = list(output_names)
+        if getattr(self, '_has_slider_concepts', False) and 'latent_image' in output_names and 'negative_latent_image' not in output_names:
+            output_names.append('negative_latent_image')
+
         sort_names = output_names + ['concept']
 
         output_names = output_names + [
@@ -344,12 +412,38 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         def before_cache_text_fun():
             model_setup.prepare_text_caching(model, config)
 
-        image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
-                                     balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'],
-                                     group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
+        has_slider = getattr(self, '_has_slider_concepts', False)
+        image_split_names = list(image_split_names)
+        sort_names = list(sort_names)
+        if has_slider and 'latent_image' in image_split_names and 'negative_latent_image' not in image_split_names:
+            image_split_names.append('negative_latent_image')
+        if has_slider and 'latent_image' in sort_names and 'negative_latent_image' not in sort_names:
+            sort_names.append('negative_latent_image')
 
-        text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+        if has_slider:
+            image_disk_cache = VerboseDiskCache(
+                cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names,
+                variations_in_name='concept.image_variations', balancing_in_name='concept.balancing',
+                balancing_strategy_in_name='concept.balancing_strategy',
+                variations_group_in_name=['concept.path', 'concept.negative_path', 'concept.type', 'concept.seed', 'concept.include_subdirectories', 'concept.image'],
+                group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun,
+                cache_label='slider image',
+            )
+            text_disk_cache = VerboseDiskCache(
+                cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[],
+                variations_in_name='concept.text_variations', balancing_in_name='concept.balancing',
+                balancing_strategy_in_name='concept.balancing_strategy',
+                variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'],
+                group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun,
+                cache_label='slider text',
+            )
+        else:
+            image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
+                                         balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'],
+                                         group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
+
+            text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
+                                        variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
 
         modules = []
 
@@ -364,13 +458,74 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 sort_names = [x for x in sort_names if x not in text_split_names]
 
         if len(sort_names) > 0:
-            variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                                 variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled')
+            sort_group_names = ['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text']
+            if has_slider:
+                sort_group_names = ['concept.path', 'concept.negative_path', 'concept.type', 'concept.seed', 'concept.include_subdirectories', 'concept.text']
+            variation_sorting = VariationSorting(
+                names=sort_names,
+                balancing_in_name='concept.balancing',
+                balancing_strategy_in_name='concept.balancing_strategy',
+                variations_group_in_name=sort_group_names,
+                group_enabled_in_name='concept.enabled',
+            )
 
             modules.append(variation_sorting)
 
         return modules
 
+
+    @staticmethod
+    def _slider_preparation_modules(preparation_modules: list) -> list:
+        slider_modules = []
+        for module in preparation_modules:
+            if isinstance(module, RescaleImageChannels) and module.image_in_name == 'image':
+                out_name = 'negative_image' if module.image_out_name == 'image' else f'negative_{module.image_out_name}'
+                slider_modules.append(OptionalRescaleImageChannels(
+                    image_in_name='negative_image',
+                    image_out_name=out_name,
+                    in_range_min=module.in_range_min,
+                    in_range_max=module.in_range_max,
+                    out_range_min=module.out_range_min,
+                    out_range_max=module.out_range_max,
+                ))
+            elif isinstance(module, ScaleImage) and module.in_name == 'image':
+                out_name = 'negative_image' if module.out_name == 'image' else f'negative_{module.out_name}'
+                slider_modules.append(OptionalScaleImage(
+                    in_name='negative_image',
+                    out_name=out_name,
+                    factor=module.factor,
+                ))
+            elif isinstance(module, NormalizeImageChannels) and module.image_in_name == 'image':
+                out_name = 'negative_image' if module.image_out_name == 'image' else f'negative_{module.image_out_name}'
+                slider_modules.append(OptionalNormalizeImageChannels(
+                    image_in_name='negative_image',
+                    image_out_name=out_name,
+                    mean=module.mean,
+                    std=module.std,
+                ))
+            elif isinstance(module, EncodeVAE) and module.in_name == 'image':
+                slider_modules.append(OptionalEncodeVAE(
+                    in_name='negative_image',
+                    out_name=f'negative_{module.out_name}',
+                    vae=module.vae,
+                    autocast_contexts=module.autocast_contexts,
+                    dtype=module.dtype,
+                ))
+            elif isinstance(module, SampleVAEDistribution) and module.in_name == 'latent_image_distribution':
+                slider_modules.append(OptionalSampleVAEDistribution(
+                    in_name='negative_latent_image_distribution',
+                    out_name=f'negative_{module.out_name}',
+                    mode=module.mode,
+                ))
+            elif isinstance(module, EncodeWuerstchenEffnet) and module.in_name == 'image':
+                slider_modules.append(OptionalEncodeWuerstchenEffnet(
+                    in_name='negative_image',
+                    out_name=f'negative_{module.out_name}',
+                    effnet_encoder=module.effnet_encoder,
+                    autocast_contexts=module.autocast_contexts,
+                    dtype=module.dtype,
+                ))
+        return slider_modules
 
     def _create_dataset(
             self,
@@ -385,6 +540,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             vae_frame_dim: bool=False,
             supports_inpainting: bool=True, #TODO many models probably don't support inpainting, but this has been enabled in most dataloaders before refactoring, too
     ):
+        self._has_slider_concepts = (not is_validation) and config.has_slider_concepts()
+
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
         load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
@@ -394,6 +551,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         if supports_inpainting:
             inpainting_modules = self._inpainting_modules(config)
         preparation_modules = self._preparation_modules(config, model)
+        if self._has_slider_concepts:
+            preparation_modules = list(preparation_modules) + self._slider_preparation_modules(preparation_modules)
         cache_modules = self._cache_modules(config, model, model_setup)
         output_modules = self._output_modules(config, model, model_setup)
 

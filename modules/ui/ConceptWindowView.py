@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QGridLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QTabWidget,
@@ -32,6 +33,9 @@ class BaseConceptWindowView:
         self.bucket_ax = None
         self.text_color = None
         self.canvas = None
+        self._image_aug_widgets = []
+        self._text_aug_widgets = []
+        self._slider_stats_widgets = []
 
     def build_general_tab(self, frame, controller, ui_state, text_ui_state):
         # name
@@ -50,26 +54,34 @@ class BaseConceptWindowView:
                                  "VALIDATION: Use concept for validation instead of training\n"
                                  "PRIOR_PREDICTION: Use the sample to make a prediction using the model as it was before training. This prediction is then used as the training target "
                                  "for the model in training. This can be used as regularisation and to preserve prior model knowledge while finetuning the model on other concepts. "
-                                 "Only implemented for LoRA.",
+                                 "Only implemented for LoRA.\n"
+                                 "SLIDER: Slider LoRA concept pairing +1 images in Path with matching -1 images in Negative Path (-1).",
                          wide_tooltip=True)
         self.components.options(frame, 2, 1, [str(x) for x in list(ConceptType)], ui_state, "type")
 
-        # path
-        self.components.label(frame, 3, 0, "Path",
-                         tooltip="Path where the training data is located")
+        # path (+1)
+        self.path_label = self.components.label(frame, 3, 0, "Path",
+                         tooltip="Path where the training data (or +1 slider pole images & captions) is located")
         self.components.path_entry(frame, 3, 1, ui_state, "path", mode="dir")
         self.components.button(frame, 3, 2, text="download now", command=controller.download_dataset_threaded,
                           tooltip="Download dataset from Huggingface now, for the purpose of previewing and statistics. Otherwise, it will be downloaded when you start training. Path must be a Huggingface repository.")
 
+        # negative path (-1) for Slider concepts
+        self.neg_path_label = self.components.label(frame, 4, 0, "Negative Path (-1)",
+                         tooltip="Path where the -1 pole images for Slider LoRA training are located (paired by matching filename with the +1 Path)")
+        self.neg_path_entry = self.components.path_entry(frame, 4, 1, ui_state, "negative_path", mode="dir")
+        self.neg_path_download_btn = self.components.button(frame, 4, 2, text="download now", command=controller.download_negative_dataset_threaded,
+                          tooltip="Download negative (-1) dataset from Huggingface now, for previewing and statistics.")
+
         # prompt source
-        self.components.label(frame, 4, 0, "Prompt Source",
+        self.components.label(frame, 5, 0, "Prompt Source",
                          tooltip="The source for prompts used during training. When selecting \"From single text file\", select a text file that contains a list of prompts")
-        prompt_path_entry = self.components.path_entry(frame, 4, 2, text_ui_state, "prompt_path", mode="file")
+        prompt_path_entry = self.components.path_entry(frame, 5, 2, text_ui_state, "prompt_path", mode="file")
 
         def set_prompt_path_entry_enabled(option: str):
             self.components.set_widget_enabled(prompt_path_entry, option == 'concept')
 
-        self.components.options_kv(frame, 4, 1, [
+        self.components.options_kv(frame, 5, 1, [
             ("From text file per sample", 'sample'),
             ("From single text file", 'concept'),
             ("From image file name", 'filename'),
@@ -77,32 +89,34 @@ class BaseConceptWindowView:
         set_prompt_path_entry_enabled(controller.concept.text.prompt_source)
 
         # include subdirectories
-        self.components.label(frame, 5, 0, "Include Subdirectories",
+        self.components.label(frame, 6, 0, "Include Subdirectories",
                          tooltip="Includes images from subdirectories into the dataset")
-        self.components.switch(frame, 5, 1, ui_state, "include_subdirectories")
+        self.components.switch(frame, 6, 1, ui_state, "include_subdirectories")
 
         # image variations
-        self.components.label(frame, 6, 0, "Image Variations",
+        self.components.label(frame, 7, 0, "Image Variations",
                          tooltip="The number of different image versions to cache if latent caching is enabled.")
-        self.components.entry(frame, 6, 1, ui_state, "image_variations")
+        self.components.entry(frame, 7, 1, ui_state, "image_variations")
 
         # text variations
-        self.components.label(frame, 7, 0, "Text Variations",
+        self.components.label(frame, 8, 0, "Text Variations",
                          tooltip="The number of different text versions to cache if latent caching is enabled.")
-        self.components.entry(frame, 7, 1, ui_state, "text_variations")
+        self.components.entry(frame, 8, 1, ui_state, "text_variations")
 
         # balancing
-        self.components.label(frame, 8, 0, "Balancing",
+        self.components.label(frame, 9, 0, "Balancing",
                          tooltip="The number of samples used during training. Use repeats to multiply the concept, or samples to specify an exact number of samples used in each epoch.")
-        self.components.entry(frame, 8, 1, ui_state, "balancing")
-        self.components.options(frame, 8, 2, [str(x) for x in list(BalancingStrategy)], ui_state, "balancing_strategy")
+        self.components.entry(frame, 9, 1, ui_state, "balancing")
+        self.components.options(frame, 9, 2, [str(x) for x in list(BalancingStrategy)], ui_state, "balancing_strategy")
 
         # loss weight
-        self.components.label(frame, 9, 0, "Loss Weight",
+        self.components.label(frame, 10, 0, "Loss Weight",
                          tooltip="The loss multiplyer for this concept.")
-        self.components.entry(frame, 9, 1, ui_state, "loss_weight")
+        self.components.entry(frame, 10, 1, ui_state, "loss_weight")
 
     def build_image_augmentation_tab(self, frame, controller, image_ui_state):
+        self._image_aug_widgets = []
+
         # header
         self.components.label(frame, 0, 1, "Random",
                          tooltip="Enable this augmentation with random values")
@@ -112,58 +126,58 @@ class BaseConceptWindowView:
         # crop jitter
         self.components.label(frame, 1, 0, "Crop Jitter",
                          tooltip="Enables random cropping of samples")
-        self.components.switch(frame, 1, 1, image_ui_state, "enable_crop_jitter")
+        self._image_aug_widgets.append(self.components.switch(frame, 1, 1, image_ui_state, "enable_crop_jitter"))
 
         # random flip
         self.components.label(frame, 2, 0, "Random Flip",
                          tooltip="Randomly flip the sample during training")
-        self.components.switch(frame, 2, 1, image_ui_state, "enable_random_flip")
-        self.components.switch(frame, 2, 2, image_ui_state, "enable_fixed_flip")
+        self._image_aug_widgets.append(self.components.switch(frame, 2, 1, image_ui_state, "enable_random_flip"))
+        self._image_aug_widgets.append(self.components.switch(frame, 2, 2, image_ui_state, "enable_fixed_flip"))
 
         # random rotation
         self.components.label(frame, 3, 0, "Random Rotation",
                          tooltip="Randomly rotates the sample during training")
-        self.components.switch(frame, 3, 1, image_ui_state, "enable_random_rotate")
-        self.components.switch(frame, 3, 2, image_ui_state, "enable_fixed_rotate")
-        self.components.entry(frame, 3, 3, image_ui_state, "random_rotate_max_angle")
+        self._image_aug_widgets.append(self.components.switch(frame, 3, 1, image_ui_state, "enable_random_rotate"))
+        self._image_aug_widgets.append(self.components.switch(frame, 3, 2, image_ui_state, "enable_fixed_rotate"))
+        self._image_aug_widgets.append(self.components.entry(frame, 3, 3, image_ui_state, "random_rotate_max_angle"))
 
         # random brightness
         self.components.label(frame, 4, 0, "Random Brightness",
                          tooltip="Randomly adjusts the brightness of the sample during training")
-        self.components.switch(frame, 4, 1, image_ui_state, "enable_random_brightness")
-        self.components.switch(frame, 4, 2, image_ui_state, "enable_fixed_brightness")
-        self.components.entry(frame, 4, 3, image_ui_state, "random_brightness_max_strength")
+        self._image_aug_widgets.append(self.components.switch(frame, 4, 1, image_ui_state, "enable_random_brightness"))
+        self._image_aug_widgets.append(self.components.switch(frame, 4, 2, image_ui_state, "enable_fixed_brightness"))
+        self._image_aug_widgets.append(self.components.entry(frame, 4, 3, image_ui_state, "random_brightness_max_strength"))
 
         # random contrast
         self.components.label(frame, 5, 0, "Random Contrast",
                          tooltip="Randomly adjusts the contrast of the sample during training")
-        self.components.switch(frame, 5, 1, image_ui_state, "enable_random_contrast")
-        self.components.switch(frame, 5, 2, image_ui_state, "enable_fixed_contrast")
-        self.components.entry(frame, 5, 3, image_ui_state, "random_contrast_max_strength")
+        self._image_aug_widgets.append(self.components.switch(frame, 5, 1, image_ui_state, "enable_random_contrast"))
+        self._image_aug_widgets.append(self.components.switch(frame, 5, 2, image_ui_state, "enable_fixed_contrast"))
+        self._image_aug_widgets.append(self.components.entry(frame, 5, 3, image_ui_state, "random_contrast_max_strength"))
 
         # random saturation
         self.components.label(frame, 6, 0, "Random Saturation",
                          tooltip="Randomly adjusts the saturation of the sample during training")
-        self.components.switch(frame, 6, 1, image_ui_state, "enable_random_saturation")
-        self.components.switch(frame, 6, 2, image_ui_state, "enable_fixed_saturation")
-        self.components.entry(frame, 6, 3, image_ui_state, "random_saturation_max_strength")
+        self._image_aug_widgets.append(self.components.switch(frame, 6, 1, image_ui_state, "enable_random_saturation"))
+        self._image_aug_widgets.append(self.components.switch(frame, 6, 2, image_ui_state, "enable_fixed_saturation"))
+        self._image_aug_widgets.append(self.components.entry(frame, 6, 3, image_ui_state, "random_saturation_max_strength"))
 
         # random hue
         self.components.label(frame, 7, 0, "Random Hue",
                          tooltip="Randomly adjusts the hue of the sample during training")
-        self.components.switch(frame, 7, 1, image_ui_state, "enable_random_hue")
-        self.components.switch(frame, 7, 2, image_ui_state, "enable_fixed_hue")
-        self.components.entry(frame, 7, 3, image_ui_state, "random_hue_max_strength")
+        self._image_aug_widgets.append(self.components.switch(frame, 7, 1, image_ui_state, "enable_random_hue"))
+        self._image_aug_widgets.append(self.components.switch(frame, 7, 2, image_ui_state, "enable_fixed_hue"))
+        self._image_aug_widgets.append(self.components.entry(frame, 7, 3, image_ui_state, "random_hue_max_strength"))
 
         # random circular mask shrink
         self.components.label(frame, 8, 0, "Circular Mask Generation",
                          tooltip="Automatically create circular masks for masked training")
-        self.components.switch(frame, 8, 1, image_ui_state, "enable_random_circular_mask_shrink")
+        self._image_aug_widgets.append(self.components.switch(frame, 8, 1, image_ui_state, "enable_random_circular_mask_shrink"))
 
         # random rotate and crop
         self.components.label(frame, 9, 0, "Random Rotate and Crop",
                          tooltip="Randomly rotate the training samples and crop to the masked region")
-        self.components.switch(frame, 9, 1, image_ui_state, "enable_random_mask_rotate_crop")
+        self._image_aug_widgets.append(self.components.switch(frame, 9, 1, image_ui_state, "enable_random_mask_rotate_crop"))
 
         # circular mask generation
         self.components.label(frame, 10, 0, "Resolution Override",
@@ -172,62 +186,64 @@ class BaseConceptWindowView:
         self.components.entry(frame, 10, 3, image_ui_state, "resolution_override")
 
     def build_text_augmentation_tab(self, frame, controller, text_ui_state):
+        self._text_aug_widgets = []
+
         # tag shuffling
         self.components.label(frame, 0, 0, "Tag Shuffling",
                          tooltip="Enables tag shuffling")
-        self.components.switch(frame, 0, 1, text_ui_state, "enable_tag_shuffling")
+        self._text_aug_widgets.append(self.components.switch(frame, 0, 1, text_ui_state, "enable_tag_shuffling"))
 
         # keep tag count
         self.components.label(frame, 1, 0, "Tag Delimiter",
                          tooltip="The delimiter between tags")
-        self.components.entry(frame, 1, 1, text_ui_state, "tag_delimiter")
+        self._text_aug_widgets.append(self.components.entry(frame, 1, 1, text_ui_state, "tag_delimiter"))
 
         # keep tag count
         self.components.label(frame, 2, 0, "Keep Tag Count",
                          tooltip="The number of tags at the start of the caption that are not shuffled or dropped")
-        self.components.entry(frame, 2, 1, text_ui_state, "keep_tags_count")
+        self._text_aug_widgets.append(self.components.entry(frame, 2, 1, text_ui_state, "keep_tags_count"))
 
         # tag dropout
         self.components.label(frame, 3, 0, "Tag Dropout",
                          tooltip="Enables random dropout for tags in the captions.")
-        self.components.switch(frame, 3, 1, text_ui_state, "tag_dropout_enable")
+        self._text_aug_widgets.append(self.components.switch(frame, 3, 1, text_ui_state, "tag_dropout_enable"))
         self.components.label(frame, 4, 0, "Dropout Mode",
                          tooltip="Method used to drop captions. 'Full' will drop the entire caption past the 'kept' tags with a certain probability, 'Random' will drop individual tags with the set probability, and 'Random Weighted' will linearly increase the probability of dropping tags, more likely to preseve tags near the front with full probability to drop at the end.")
-        self.components.options_kv(frame, 4, 1, [
+        self._text_aug_widgets.append(self.components.options_kv(frame, 4, 1, [
             ("Full", 'FULL'),
             ("Random", 'RANDOM'),
             ("Random Weighted", 'RANDOM WEIGHTED'),
-        ], text_ui_state, "tag_dropout_mode", None)
+        ], text_ui_state, "tag_dropout_mode", None))
         self.components.label(frame, 4, 2, "Probability",
                          tooltip="Probability to drop tags, from 0 to 1.")
-        self.components.entry(frame, 4, 3, text_ui_state, "tag_dropout_probability")
+        self._text_aug_widgets.append(self.components.entry(frame, 4, 3, text_ui_state, "tag_dropout_probability"))
 
         self.components.label(frame, 5, 0, "Special Dropout Tags",
                          tooltip="List of tags which will be whitelisted/blacklisted by dropout. 'Whitelist' tags will never be dropped but all others may be, 'Blacklist' tags may be dropped but all others will never be, 'None' may drop any tags. Can specify either a delimiter-separated list in the field, or a file path to a .txt or .csv file with entries separated by newlines.")
-        self.components.options_kv(frame, 5, 1, [
+        self._text_aug_widgets.append(self.components.options_kv(frame, 5, 1, [
             ("None", 'NONE'),
             ("Blacklist", 'BLACKLIST'),
             ("Whitelist", 'WHITELIST'),
-        ], text_ui_state, "tag_dropout_special_tags_mode", None)
-        self.components.entry(frame, 5, 2, text_ui_state, "tag_dropout_special_tags")
+        ], text_ui_state, "tag_dropout_special_tags_mode", None))
+        self._text_aug_widgets.append(self.components.entry(frame, 5, 2, text_ui_state, "tag_dropout_special_tags"))
         self.components.label(frame, 6, 0, "Special Tags Regex",
                          tooltip="Interpret special tags with regex, such as 'photo.*' to match 'photo, photograph, photon' but not 'telephoto'. Includes exception for '/(' and '/)' syntax found in many booru/e6 tags.")
-        self.components.switch(frame, 6, 1, text_ui_state, "tag_dropout_special_tags_regex")
+        self._text_aug_widgets.append(self.components.switch(frame, 6, 1, text_ui_state, "tag_dropout_special_tags_regex"))
 
         #capitalization randomization
         self.components.label(frame, 7, 0, "Randomize Capitalization",
                          tooltip="Enables randomization of capitalization for tags in the caption.")
-        self.components.switch(frame, 7, 1, text_ui_state, "caps_randomize_enable")
+        self._text_aug_widgets.append(self.components.switch(frame, 7, 1, text_ui_state, "caps_randomize_enable"))
         self.components.label(frame, 7, 2, "Force Lowercase",
                          tooltip="If enabled, converts the caption to lowercase before any further processing.")
-        self.components.switch(frame, 7, 3, text_ui_state, "caps_randomize_lowercase")
+        self._text_aug_widgets.append(self.components.switch(frame, 7, 3, text_ui_state, "caps_randomize_lowercase"))
 
         self.components.label(frame, 8, 0, "Captialization Mode",
                          tooltip="Comma-separated list of types of capitalization randomization to perform. 'capslock' for ALL CAPS, 'title' for First Letter Of Every Word, 'first' for First word only, 'random' for rAndOMiZeD lEtTERs.")
-        self.components.entry(frame, 8, 1, text_ui_state, "caps_randomize_mode")
+        self._text_aug_widgets.append(self.components.entry(frame, 8, 1, text_ui_state, "caps_randomize_mode"))
         self.components.label(frame, 8, 2, "Probability",
                          tooltip="Probability to randomize capitialization of each tag, from 0 to 1.")
-        self.components.entry(frame, 8, 3, text_ui_state, "caps_randomize_probability")
+        self._text_aug_widgets.append(self.components.entry(frame, 8, 3, text_ui_state, "caps_randomize_probability"))
 
     def build_concept_stats_tab(self, frame, controller):
         self.concept_stats_tab = frame
@@ -320,22 +336,48 @@ class BaseConceptWindowView:
                          tooltip="Smallest caption in concept by character count. For token count, assume ~2 tokens/word", underline=True)
         self.caption_min_preview = self.components.label(frame, 16, 2, pad=0, text="-", wraplength=150)
 
+        #slider stats
+        self.slider_found_pairs_label = self.components.label(frame, 17, 0, "\nFound Pairs", pad=0,
+                         tooltip="Number of matching image filenames found in both the +1 and -1 slider folders", underline=True)
+        self.slider_found_pairs_preview = self.components.label(frame, 18, 0, pad=0, text="-")
+        self.slider_unmatched_pairs_label = self.components.label(frame, 17, 1, "\nUnmatched Pairs", pad=0,
+                         tooltip="Number of images present in only one of the +1 or -1 slider folders", underline=True)
+        self.slider_unmatched_pairs_preview = self.components.label(frame, 18, 1, pad=0, text="-")
+        self.slider_matching_pairs_label = self.components.label(frame, 17, 2, "\nMatching Pairs", pad=0,
+                         tooltip="Number of slider pairs matching by both filename and image dimensions", underline=True)
+        self.slider_matching_pairs_preview = self.components.label(frame, 18, 2, pad=0, text="-")
+        self.slider_validation_label = self.components.label(frame, 17, 3, "\nPair Validation", pad=0,
+                         tooltip="Result of filename and dimension validation across +1 and -1 slider folders", underline=True)
+        self.slider_validation_preview = self.components.label(frame, 18, 3, pad=0, text="-", wraplength=180)
+        self._slider_stats_widgets = [
+            self.slider_found_pairs_label,
+            self.slider_found_pairs_preview,
+            self.slider_unmatched_pairs_label,
+            self.slider_unmatched_pairs_preview,
+            self.slider_matching_pairs_label,
+            self.slider_matching_pairs_preview,
+            self.slider_validation_label,
+            self.slider_validation_preview,
+        ]
+
         #aspect bucket info
-        self.aspect_bucket_label = self.components.label(frame, 17, 0, "\nAspect Bucketing", pad=0,
+        self.aspect_bucket_label = self.components.label(frame, 19, 0, "\nAspect Bucketing", pad=0,
                          tooltip="Graph of all possible buckets and the number of images in each one, defined as height/width. Buckets range from 0.25 (4:1 extremely wide) to 4 (1:4 extremely tall). \
                             Images which don't match a bucket exactly are cropped to the nearest one.", underline=True)
-        self.small_bucket_label = self.components.label(frame, 17, 1, "\nSmallest Buckets", pad=0,
+        self.small_bucket_label = self.components.label(frame, 19, 1, "\nSmallest Buckets", pad=0,
                          tooltip="Image buckets with the least nonzero total images - if 'batch size' is larger than this, these images will be ignored during training! See the wiki for more details.", underline=True)
-        self.small_bucket_preview = self.components.label(frame, 18, 1, pad=0, text="-")
+        self.small_bucket_preview = self.components.label(frame, 20, 1, pad=0, text="-")
 
         #refresh stats - must be after all labels are defined or will give error
         self.refresh_basic_stats_button = self.components.button(master=frame, row=0, column=0, text="Refresh Basic", command=lambda: controller.get_concept_stats_threaded(self, False, 9999),
                           tooltip="Reload basic statistics for the concept directory")
         self.refresh_advanced_stats_button = self.components.button(master=frame, row=0, column=1, text="Refresh Advanced", command=lambda: controller.get_concept_stats_threaded(self, True, 9999),
                           tooltip="Reload advanced statistics for the concept directory")       #run "basic" scan first before "advanced", seems to help the system cache the directories and run faster
-        self.cancel_stats_button = self.components.button(master=frame, row=0, column=2, text="Abort Scan", command=lambda: self._cancel_concept_stats(controller),
+        self.validate_slider_button = self.components.button(master=frame, row=0, column=2, text="Validate Pairs", command=lambda: controller.validate_slider_pairs_threaded(self),
+                          tooltip="Validate that filenames and image dimensions match across +1 and -1 slider folders")
+        self.cancel_stats_button = self.components.button(master=frame, row=0, column=3, text="Abort Scan", command=lambda: self._cancel_concept_stats(controller),
                           tooltip="Stop the currently running scan if it's taking a long time - advanced scan will be slow on large folders and on HDDs")
-        self.processing_time = self.components.label(frame, 0, 3, text="-", tooltip="Time taken to process concept directory")
+        self.processing_time = self.components.label(frame, 0, 4, text="-", tooltip="Time taken to process concept directory")
 
     def _update_concept_stats(self, controller):
         #file size
@@ -448,6 +490,13 @@ class BaseConceptWindowView:
         sec.tick_params('x', length=0)
         self.canvas.draw()
 
+        # slider pair stats
+        stats = controller.concept.concept_stats
+        self.components.set_label_text(self.slider_found_pairs_preview, stats.get("slider_found_pairs", "-"))
+        self.components.set_label_text(self.slider_unmatched_pairs_preview, stats.get("slider_unmatched_pairs", "-"))
+        self.components.set_label_text(self.slider_matching_pairs_preview, stats.get("slider_matching_pairs", "-"))
+        self.components.set_label_text(self.slider_validation_preview, stats.get("slider_validation_status", "-"))
+
     def decimal_to_aspect_ratio(self, value : float):
         #find closest fraction to decimal aspect value and convert to a:b format
         aspect_fraction = fractions.Fraction(value).limit_denominator(16)
@@ -457,10 +506,19 @@ class BaseConceptWindowView:
     def _disable_scan_buttons(self):
         self.components.set_widget_enabled(self.refresh_basic_stats_button, False)
         self.components.set_widget_enabled(self.refresh_advanced_stats_button, False)
+        self.components.set_widget_enabled(self.validate_slider_button, False)
 
     def _enable_scan_buttons(self):
         self.components.set_widget_enabled(self.refresh_basic_stats_button, True)
         self.components.set_widget_enabled(self.refresh_advanced_stats_button, True)
+        is_slider = ConceptType(self.controller.concept.type) == ConceptType.SLIDER
+        self.components.set_widget_enabled(self.validate_slider_button, is_slider)
+
+    def _show_slider_validation_result(self, validation: dict):
+        if validation["valid"]:
+            QMessageBox.information(self, "Slider Pair Validation", f"{validation['summary']}\n\n{validation['details']}")
+        else:
+            QMessageBox.warning(self, "Slider Pair Validation", f"{validation['summary']}\n\n{validation['details']}")
 
     def _cancel_concept_stats(self, controller):
         controller.cancel_scan_flag.set()
@@ -484,6 +542,9 @@ class ConceptWindowView(BaseConceptWindowView, QDialog):
         BaseConceptWindowView.__init__(self, pyside6_components)
 
         self.controller = controller
+        self.ui_state = ui_state
+        self.image_ui_state = image_ui_state
+        self.text_ui_state = text_ui_state
         self.image_preview_file_index = 0
         self._preview_augmentations = True
         self.bucket_fig = None
@@ -594,6 +655,7 @@ class ConceptWindowView(BaseConceptWindowView, QDialog):
         stats_lo.setColumnMinimumWidth(1, 150)
         stats_lo.setColumnMinimumWidth(2, 150)
         stats_lo.setColumnMinimumWidth(3, 150)
+        stats_lo.setColumnMinimumWidth(4, 90)
         self.build_concept_stats_tab(stats_frame, controller)
 
         plt.set_loglevel('WARNING')
@@ -616,7 +678,7 @@ class ConceptWindowView(BaseConceptWindowView, QDialog):
         self.bucket_ax.xaxis.label.set_color(self.text_color)
         self.bucket_ax.yaxis.label.set_color(self.text_color)
 
-        stats_lo.addWidget(self.canvas, 19, 0, 2, 4)
+        stats_lo.addWidget(self.canvas, 21, 0, 2, 5)
 
         tabs.addTab(stats_scroll, "statistics")
 
@@ -624,9 +686,71 @@ class ConceptWindowView(BaseConceptWindowView, QDialog):
         ok.clicked.connect(self._ok)
         outer.addWidget(ok, 1, 0)
 
+        self._type_trace_id = self.ui_state.add_var_trace("type", self._sync_slider_mode)
+        self._sync_slider_mode()
+
         #automatic concept scan
         self.scan_thread = threading.Thread(target=controller.auto_update_concept_stats, args=[self], daemon=True)
         self.scan_thread.start()
+
+    def _disable_slider_augmentations(self):
+        img_bool_fields = (
+            "enable_crop_jitter",
+            "enable_random_flip",
+            "enable_fixed_flip",
+            "enable_random_rotate",
+            "enable_fixed_rotate",
+            "enable_random_brightness",
+            "enable_fixed_brightness",
+            "enable_random_contrast",
+            "enable_fixed_contrast",
+            "enable_random_saturation",
+            "enable_fixed_saturation",
+            "enable_random_hue",
+            "enable_fixed_hue",
+            "enable_random_circular_mask_shrink",
+            "enable_random_mask_rotate_crop",
+        )
+        for field_name in img_bool_fields:
+            self.image_ui_state.get_var(field_name).set(False)
+
+        text_bool_fields = (
+            "enable_tag_shuffling",
+            "tag_dropout_enable",
+            "caps_randomize_enable",
+            "caps_randomize_lowercase",
+        )
+        for field_name in text_bool_fields:
+            self.text_ui_state.get_var(field_name).set(False)
+
+    def _sync_slider_mode(self):
+        try:
+            is_slider = ConceptType(self.controller.concept.type) == ConceptType.SLIDER
+        except (ValueError, TypeError):
+            is_slider = False
+
+        self.components.set_label_text(self.path_label, "Positive Path (+1)" if is_slider else "Path")
+        for widget in (self.neg_path_label, self.neg_path_entry, self.neg_path_download_btn):
+            widget.setVisible(is_slider)
+            widget.setEnabled(is_slider)
+
+        if is_slider:
+            self._disable_slider_augmentations()
+            self._preview_augmentations = False
+            self._aug_checkbox.setChecked(False)
+        self._aug_checkbox.setEnabled(not is_slider)
+
+        for widget in self._image_aug_widgets:
+            widget.setEnabled(not is_slider)
+        for widget in self._text_aug_widgets:
+            widget.setEnabled(not is_slider)
+
+        self.validate_slider_button.setVisible(is_slider)
+        self.validate_slider_button.setEnabled(is_slider)
+        for widget in self._slider_stats_widgets:
+            widget.setVisible(is_slider)
+
+        self._update_image_preview()
 
 
     def _on_aug_toggle(self, checked: bool):
@@ -655,6 +779,9 @@ class ConceptWindowView(BaseConceptWindowView, QDialog):
         # stop the background scan thread (reuses the Abort Scan mechanism) so it
         # stops touching this window's widgets, and release the matplotlib figure
         self.controller.cancel_scan_flag.set()
+        if getattr(self, "_type_trace_id", None) is not None:
+            self.ui_state.remove_var_trace("type", self._type_trace_id)
+            self._type_trace_id = None
         if self.bucket_fig is not None:
             plt.close(self.bucket_fig)
             self.bucket_fig = None

@@ -6,6 +6,7 @@ import time
 from modules.util import path_util
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.image_util import load_image
+from modules.util.slider_util import SliderPairScanResult, log_slider_scan_result, scan_slider_pairs
 
 from mgds.pipelineModules.AspectBucketing import AspectBucketing
 
@@ -44,7 +45,12 @@ def init_concept_stats(advanced_checks : bool):
                 "min_caption_length" : "-",
                 "avg_caption_length" : "-",
                 "aspect_buckets" : {},
-                "force_cancelled" : False
+                "force_cancelled" : False,
+                "slider_found_pairs" : "-",
+                "slider_unmatched_pairs" : "-",
+                "slider_matching_pairs" : "-",
+                "slider_dimension_mismatches" : "-",
+                "slider_validation_status" : "-",
             }
 
     #advanced stats default to "-" above if not measured, but need to be initialized to specific values if they are
@@ -83,11 +89,31 @@ def init_concept_stats(advanced_checks : bool):
 
     return stats_dict
 
-def folder_scan(dir, stats_dict : dict, advanced_checks : bool, conceptconfig : ConceptConfig, start_time : float, wait_time : float, cancel_scan_flag : threading.Event):
+def _safe_relpath(path: os.PathLike | str, base_dir: str | None) -> str:
+    path_str = os.fspath(path)
+    if not base_dir:
+        return os.path.basename(path_str)
+    try:
+        return os.path.relpath(path_str, base_dir)
+    except ValueError:
+        return path_str
+
+
+def folder_scan(
+        dir,
+        stats_dict : dict,
+        advanced_checks : bool,
+        conceptconfig : ConceptConfig,
+        start_time : float,
+        wait_time : float,
+        cancel_scan_flag : threading.Event,
+        base_dir: str | None = None,
+):
     #break and return defaults if no path or nonexistent path
     if not os.path.isdir(dir):
         stats_dict["force_cancelled"] = True
         return stats_dict
+    rel_base = base_dir if base_dir is not None else conceptconfig.path
     img_extensions_list = path_util.SUPPORTED_IMAGE_EXTENSIONS
     vid_extensions_list = path_util.SUPPORTED_VIDEO_EXTENSIONS
     file_list = [f for f in os.scandir(dir) if f.is_file()]     #this may take time on large directories
@@ -121,9 +147,9 @@ def folder_scan(dir, stats_dict : dict, advanced_checks : bool, conceptconfig : 
                             char_count = len(caption)
                             word_count = len(caption.split())
                             if char_count > stats_dict["max_caption_length"][0]:
-                                stats_dict["max_caption_length"] = [char_count, os.path.relpath(path, conceptconfig.path), word_count]
+                                stats_dict["max_caption_length"] = [char_count, _safe_relpath(path, rel_base), word_count]
                             if char_count < stats_dict["min_caption_length"][0]:
-                                stats_dict["min_caption_length"] = [char_count, os.path.relpath(path, conceptconfig.path), word_count]
+                                stats_dict["min_caption_length"] = [char_count, _safe_relpath(path, rel_base), word_count]
                             stats_dict["avg_caption_length"][0] += (char_count - stats_dict["avg_caption_length"][0])/(stats_dict["image_count"] + stats_dict["video_count"])
                             stats_dict["avg_caption_length"][1] += (word_count - stats_dict["avg_caption_length"][1])/(stats_dict["image_count"] + stats_dict["video_count"])
 
@@ -142,9 +168,9 @@ def folder_scan(dir, stats_dict : dict, advanced_checks : bool, conceptconfig : 
                 stats_dict["aspect_buckets"][nearest_aspect] += 1
 
                 if pixels > stats_dict["max_pixels"][0]:
-                    stats_dict["max_pixels"] = [pixels, os.path.relpath(path, conceptconfig.path), f'{width}w x {height}h']
+                    stats_dict["max_pixels"] = [pixels, _safe_relpath(path, rel_base), f'{width}w x {height}h']
                 if pixels < stats_dict["min_pixels"][0]:
-                    stats_dict["min_pixels"] = [pixels, os.path.relpath(path, conceptconfig.path), f'{width}w x {height}h']
+                    stats_dict["min_pixels"] = [pixels, _safe_relpath(path, rel_base), f'{width}w x {height}h']
                 stats_dict["avg_pixels"] += (pixels - stats_dict["avg_pixels"])/(stats_dict["image_count"] + stats_dict["video_count"])
 
         elif extension.lower() in vid_extensions_list:
@@ -166,9 +192,9 @@ def folder_scan(dir, stats_dict : dict, advanced_checks : bool, conceptconfig : 
                             char_count = len(caption)
                             word_count = len(caption.split())
                             if char_count > stats_dict["max_caption_length"][0]:
-                                stats_dict["max_caption_length"] = [char_count, os.path.relpath(path, conceptconfig.path), word_count]
+                                stats_dict["max_caption_length"] = [char_count, _safe_relpath(path, rel_base), word_count]
                             if char_count < stats_dict["min_caption_length"][0]:
-                                stats_dict["min_caption_length"] = [char_count, os.path.relpath(path, conceptconfig.path), word_count]
+                                stats_dict["min_caption_length"] = [char_count, _safe_relpath(path, rel_base), word_count]
                             stats_dict["avg_caption_length"][0] += (char_count - stats_dict["avg_caption_length"][0])/(stats_dict["image_count"] + stats_dict["video_count"])
                             stats_dict["avg_caption_length"][1] += (word_count - stats_dict["avg_caption_length"][1])/(stats_dict["image_count"] + stats_dict["video_count"])
 
@@ -185,21 +211,21 @@ def folder_scan(dir, stats_dict : dict, advanced_checks : bool, conceptconfig : 
                 stats_dict["aspect_buckets"][nearest_aspect] += 1
 
                 if pixels > stats_dict["max_pixels"][0]:
-                    stats_dict["max_pixels"] = [pixels, os.path.relpath(path, conceptconfig.path), f'{width}w x {height}h']
+                    stats_dict["max_pixels"] = [pixels, _safe_relpath(path, rel_base), f'{width}w x {height}h']
                 if pixels < stats_dict["min_pixels"][0]:
-                    stats_dict["min_pixels"] = [pixels, os.path.relpath(path, conceptconfig.path), f'{width}w x {height}h']
+                    stats_dict["min_pixels"] = [pixels, _safe_relpath(path, rel_base), f'{width}w x {height}h']
                 stats_dict["avg_pixels"] += (pixels - stats_dict["avg_pixels"])/(stats_dict["image_count"] + stats_dict["video_count"])
 
                 if length > stats_dict["max_length"][0]:
-                    stats_dict["max_length"] = [length, os.path.relpath(path, conceptconfig.path)]
+                    stats_dict["max_length"] = [length, _safe_relpath(path, rel_base)]
                 if length < stats_dict["min_length"][0]:
-                    stats_dict["min_length"] = [length, os.path.relpath(path, conceptconfig.path)]
+                    stats_dict["min_length"] = [length, _safe_relpath(path, rel_base)]
                 stats_dict["avg_length"] += (length - stats_dict["avg_length"])/stats_dict["video_count"]
 
                 if fps > stats_dict["max_fps"][0]:
-                    stats_dict["max_fps"] = [fps, os.path.relpath(path, conceptconfig.path)]
+                    stats_dict["max_fps"] = [fps, _safe_relpath(path, rel_base)]
                 if fps < stats_dict["min_fps"][0]:
-                    stats_dict["min_fps"] = [fps, os.path.relpath(path, conceptconfig.path)]
+                    stats_dict["min_fps"] = [fps, _safe_relpath(path, rel_base)]
                 stats_dict["avg_fps"] += (fps - stats_dict["avg_fps"])/stats_dict["video_count"]
 
         elif path.name.endswith("-masklabel.png"):
@@ -308,3 +334,144 @@ def subfolder_scan_threaded(conceptconfig : ConceptConfig, advanced_checks : boo
     final_stats = combine_stats_dicts(stats_results, conceptconfig, advanced_checks)
     final_stats["processing_time"] = time.perf_counter() - start_time
     return final_stats
+
+
+def _build_slider_validation_summary(result: SliderPairScanResult, check_dimensions: bool) -> str:
+    unmatched_total = len(result.unmatched_positive) + len(result.unmatched_negative)
+    duplicates_total = len(result.duplicate_positive) + len(result.duplicate_negative)
+    mismatched_dims = len(result.mismatched_dimensions)
+
+    if (
+        result.matching_pairs_count > 0
+        and unmatched_total == 0
+        and duplicates_total == 0
+        and (not check_dimensions or mismatched_dims == 0)
+    ):
+        mode_note = "filenames & dimensions verified" if check_dimensions else "filenames verified"
+        return f"Valid: {result.matching_pairs_count} matching pair(s) ({mode_note})"
+
+    issues = []
+    if result.matching_pairs_count == 0 and result.found_pairs_count == 0:
+        issues.append("no matching pairs found")
+    else:
+        issues.append(f"{result.matching_pairs_count} matching")
+    if unmatched_total > 0:
+        issues.append(f"{unmatched_total} unmatched (+1: {len(result.unmatched_positive)}, -1: {len(result.unmatched_negative)})")
+    if check_dimensions and mismatched_dims > 0:
+        issues.append(f"{mismatched_dims} dimension mismatch(es)")
+    if duplicates_total > 0:
+        issues.append(f"{duplicates_total} duplicate stem(s)")
+    return "Issues: " + ", ".join(issues)
+
+
+def update_slider_stats(
+        stats_dict: dict,
+        pos_dir: str | None,
+        neg_dir: str | None,
+        include_subdirectories: bool,
+        check_dimensions: bool = True,
+) -> SliderPairScanResult | None:
+    if not pos_dir or not os.path.isdir(pos_dir) or not neg_dir or not os.path.isdir(neg_dir):
+        stats_dict["slider_found_pairs"] = 0
+        stats_dict["slider_unmatched_pairs"] = 0
+        stats_dict["slider_matching_pairs"] = 0
+        stats_dict["slider_dimension_mismatches"] = 0
+        stats_dict["slider_validation_status"] = "Missing +1 or -1 directory"
+        return None
+
+    result = scan_slider_pairs(
+        pos_dir,
+        neg_dir,
+        include_subdirectories=include_subdirectories,
+        check_dimensions=check_dimensions,
+    )
+    unmatched_total = len(result.unmatched_positive) + len(result.unmatched_negative)
+    stats_dict["slider_found_pairs"] = result.found_pairs_count
+    stats_dict["slider_unmatched_pairs"] = unmatched_total
+    stats_dict["slider_matching_pairs"] = result.matching_pairs_count
+    stats_dict["slider_dimension_mismatches"] = len(result.mismatched_dimensions)
+    stats_dict["slider_validation_status"] = _build_slider_validation_summary(result, check_dimensions)
+    return result
+
+
+def validate_slider_concept(
+        pos_dir: str | None,
+        neg_dir: str | None,
+        include_subdirectories: bool,
+        concept_name: str = "",
+) -> dict:
+    if not pos_dir or not os.path.isdir(pos_dir):
+        summary = f"Positive (+1) directory does not exist: {pos_dir or '(empty)'}"
+        return {
+            "valid": False,
+            "found_pairs": 0,
+            "unmatched_pairs": 0,
+            "matching_pairs": 0,
+            "dimension_mismatches": 0,
+            "summary": summary,
+            "details": summary,
+            "result": None,
+        }
+    if not neg_dir or not os.path.isdir(neg_dir):
+        summary = f"Negative (-1) directory does not exist: {neg_dir or '(empty)'}"
+        return {
+            "valid": False,
+            "found_pairs": 0,
+            "unmatched_pairs": 0,
+            "matching_pairs": 0,
+            "dimension_mismatches": 0,
+            "summary": summary,
+            "details": summary,
+            "result": None,
+        }
+
+    result = scan_slider_pairs(
+        pos_dir,
+        neg_dir,
+        include_subdirectories=include_subdirectories,
+        check_dimensions=True,
+    )
+    log_slider_scan_result(concept_name, result)
+
+    unmatched_total = len(result.unmatched_positive) + len(result.unmatched_negative)
+    duplicates_total = len(result.duplicate_positive) + len(result.duplicate_negative)
+    mismatched_dims = len(result.mismatched_dimensions)
+    is_valid = (
+        result.matching_pairs_count > 0
+        and unmatched_total == 0
+        and duplicates_total == 0
+        and mismatched_dims == 0
+    )
+    summary = _build_slider_validation_summary(result, check_dimensions=True)
+
+    detail_lines = [
+        f"Found pairs (by filename): {result.found_pairs_count}",
+        f"Matching pairs (filenames + dimensions): {result.matching_pairs_count}",
+        f"Unmatched pairs: {unmatched_total} (+1 only: {len(result.unmatched_positive)}, -1 only: {len(result.unmatched_negative)})",
+        f"Dimension mismatches: {mismatched_dims}",
+    ]
+    if result.unmatched_positive:
+        detail_lines.append("Unmatched +1: " + ", ".join(result.unmatched_positive[:10]))
+    if result.unmatched_negative:
+        detail_lines.append("Unmatched -1: " + ", ".join(result.unmatched_negative[:10]))
+    if result.mismatched_dimensions:
+        dim_items = [
+            f"{key} (+1: {pw}x{ph} vs -1: {nw}x{nh})"
+            for key, _, _, (pw, ph), (nw, nh) in result.mismatched_dimensions[:10]
+        ]
+        detail_lines.append("Dimension mismatches: " + ", ".join(dim_items))
+    if result.duplicate_positive:
+        detail_lines.append("Duplicate stems in +1: " + ", ".join(result.duplicate_positive[:10]))
+    if result.duplicate_negative:
+        detail_lines.append("Duplicate stems in -1: " + ", ".join(result.duplicate_negative[:10]))
+
+    return {
+        "valid": is_valid,
+        "found_pairs": result.found_pairs_count,
+        "unmatched_pairs": unmatched_total,
+        "matching_pairs": result.matching_pairs_count,
+        "dimension_mismatches": mismatched_dims,
+        "summary": summary,
+        "details": "\n".join(detail_lines),
+        "result": result,
+    }

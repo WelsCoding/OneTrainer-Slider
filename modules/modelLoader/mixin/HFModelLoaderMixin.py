@@ -418,7 +418,10 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
 
             if any(not os.path.isfile(f) for f in full_filenames):
                 # fall back to the pytorch_model_filename
-                full_filenames = [os.path.join(pretrained_model_name_or_path, subfolder, pytorch_model_filename)]
+                if subfolder:
+                    full_filenames = [os.path.join(pretrained_model_name_or_path, subfolder, pytorch_model_filename)]
+                else:
+                    full_filenames = [os.path.join(pretrained_model_name_or_path, pytorch_model_filename)]
                 is_torch_pickle = True
         else:
             try:
@@ -842,11 +845,51 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             config: str | None = None,
             stream_from_disk: bool = False,
     ):
-        # a single-file (optionally GGUF-quantized) checkpoint is loaded directly, using
-        # a separate repo to source the model config if the checkpoint doesn't carry one;
-        # otherwise the transformer is loaded from its subfolder in the base model repo.
+        # A transformer override can be a diffusers directory / HF repo or a single-file
+        # (optionally GGUF-quantized) checkpoint using `config` for the model architecture;
+        # otherwise load from the base model's "transformer" subfolder.
         # Returns a (transformer, materialize_fn) pair, materialize_fn None when not streamed.
         if transformer_model_name:
+            if os.path.isdir(transformer_model_name):
+                subfolder = None if os.path.isfile(os.path.join(transformer_model_name, "config.json")) else "transformer"
+                return self._load_diffusers_sub_module(
+                    module_type,
+                    weight_dtypes.transformer,
+                    weight_dtypes.train_dtype,
+                    transformer_model_name,
+                    subfolder,
+                    quantization,
+                    stream_from_disk=stream_from_disk,
+                )
+
+            ext = os.path.splitext(transformer_model_name)[1].lower()
+            is_single_file = (
+                os.path.isfile(transformer_model_name)
+                or transformer_model_name.startswith(("http://", "https://"))
+                or ext in {".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft"}
+            )
+            if not is_single_file:
+                try:
+                    return self._load_diffusers_sub_module(
+                        module_type,
+                        weight_dtypes.transformer,
+                        weight_dtypes.train_dtype,
+                        transformer_model_name,
+                        "transformer",
+                        quantization,
+                        stream_from_disk=stream_from_disk,
+                    )
+                except Exception:
+                    return self._load_diffusers_sub_module(
+                        module_type,
+                        weight_dtypes.transformer,
+                        weight_dtypes.train_dtype,
+                        transformer_model_name,
+                        None,
+                        quantization,
+                        stream_from_disk=stream_from_disk,
+                    )
+
             single_file_kwargs = {}
             if config is not None:
                 single_file_kwargs["config"] = config

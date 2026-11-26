@@ -209,6 +209,7 @@ class SampleConfig(BaseConfig):
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(data)
+        self.slider_multiplier = 1.0
 
     def from_dict(self, data: dict, migrate: bool = True) -> 'SampleConfig':
         if "override_shift" in data:

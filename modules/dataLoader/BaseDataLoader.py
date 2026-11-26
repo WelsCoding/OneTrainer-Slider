@@ -10,6 +10,29 @@ from modules.util.TrainProgress import TrainProgress
 from mgds.MGDS import MGDS, TrainDataLoader
 
 import torch
+from torch.utils.data import DataLoader, default_collate
+
+
+def _slider_safe_collate(batch: list[dict]) -> dict:
+    if not batch:
+        return {}
+    all_keys = list(dict.fromkeys(key for sample in batch for key in sample))
+    none_keys = {key for key in all_keys if any(sample.get(key) is None for sample in batch)}
+    if not none_keys:
+        return default_collate(batch)
+
+    collated = default_collate([
+        {key: value for key, value in sample.items() if key not in none_keys}
+        for sample in batch
+    ])
+    for key in none_keys:
+        collated[key] = [sample.get(key) for sample in batch]
+    return collated
+
+
+class SliderSafeTrainDataLoader(TrainDataLoader):
+    def __init__(self, dataset: MGDS, batch_size: int):
+        DataLoader.__init__(self, dataset, batch_size=batch_size, drop_last=True, collate_fn=_slider_safe_collate)
 
 
 class BaseDataLoader(
@@ -44,7 +67,7 @@ class BaseDataLoader(
             train_progress=train_progress,
             is_validation=is_validation,
         )
-        self.__dl = TrainDataLoader(self.__ds, config.batch_size)
+        self.__dl = SliderSafeTrainDataLoader(self.__ds, config.batch_size)
 
     def get_data_set(self) -> MGDS:
         return self.__ds
