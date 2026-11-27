@@ -128,6 +128,7 @@ class ConceptTextConfig(BaseConfig):
 class ConceptConfig(BaseConfig):
     name: str
     path: str
+    negative_path: str
     seed: int
     enabled: bool
     type: ConceptType
@@ -186,6 +187,7 @@ class ConceptConfig(BaseConfig):
 
         data.append(("name", "", str, False))
         data.append(("path", "", str, False))
+        data.append(("negative_path", "", str, False))
         data.append(("seed", random.randint(-(1 << 30), 1 << 30), int, False))
         data.append(("enabled", True, bool, False))
         data.append(("type", ConceptType.STANDARD, ConceptType, False))

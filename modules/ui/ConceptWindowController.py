@@ -9,6 +9,7 @@ import traceback
 from modules.util import concept_stats, huggingface_util, path_util
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.ConceptType import ConceptType
 from modules.util.image_util import load_image
 
 from mgds.LoadingPipeline import LoadingPipeline
@@ -44,7 +45,9 @@ class ConceptWindowController:
         self.scan_thread = None
 
     @staticmethod
-    def get_concept_path(path: str) -> str | None:
+    def get_concept_path(path: str | None) -> str | None:
+        if not path:
+            return None
         if os.path.isdir(path):
             return path
         try:
@@ -53,19 +56,31 @@ class ConceptWindowController:
         except Exception:
             return None
 
-    def download_dataset(self):
+    def _download_repo(self, path: str | None):
+        if not path:
+            return
         try:
             huggingface_util.configure_hub(
                 self.train_config.secrets.huggingface_token,
                 offline_mode=self.train_config.offline_mode,
                 cache_dir=self.train_config.huggingface_cache_dir,
             )
-            huggingface_hub.snapshot_download(repo_id=self.concept.path, repo_type="dataset")
+            huggingface_hub.snapshot_download(repo_id=path, repo_type="dataset")
         except Exception:
             traceback.print_exc()
 
+    def download_dataset(self):
+        self._download_repo(self.concept.path)
+
     def download_dataset_threaded(self):
         download_thread = threading.Thread(target=self.download_dataset, daemon=True)
+        download_thread.start()
+
+    def download_negative_dataset(self):
+        self._download_repo(self.concept.negative_path)
+
+    def download_negative_dataset_threaded(self):
+        download_thread = threading.Thread(target=self.download_negative_dataset, daemon=True)
         download_thread.start()
 
     def _read_text_file_for_preview(self, file_path: str, preview_augmentations: bool) -> str:
@@ -132,6 +147,9 @@ class ConceptWindowController:
             }
             file_path = file_map.get(source)
             prompt_output = self._read_text_file_for_preview(str(file_path), preview_augmentations) if file_path else "[Empty prompt]"
+
+        if ConceptType(self.concept.type) == ConceptType.SLIDER:
+            preview_augmentations = False
 
         modules = []
         if preview_augmentations:
@@ -239,25 +257,53 @@ class ConceptWindowController:
         self.cancel_scan_flag.clear()
         view.components.call_after(view.concept_stats_tab, 0, view._disable_scan_buttons)
         concept_path = self.get_concept_path(self.concept.path)
+        is_slider = ConceptType(self.concept.type) == ConceptType.SLIDER
+        negative_path = self.get_concept_path(self.concept.negative_path) if is_slider else None
 
         if not concept_path:
-           print(f"Unable to get statistics for concept path: {self.concept.path}")
-           view.components.call_after(view.concept_stats_tab, 0, view._enable_scan_buttons)
-           return
-        subfolders = [concept_path]
+            print(f"Unable to get statistics for concept path: {self.concept.path}")
+            view.components.call_after(view.concept_stats_tab, 0, view._enable_scan_buttons)
+            return
+
+        scan_roots: list[tuple[str, str]] = [(concept_path, concept_path)]
+        if is_slider and negative_path:
+            scan_roots.append((negative_path, negative_path))
 
         stats_dict = concept_stats.init_concept_stats(advanced_checks)
-        for path in subfolders:
+        for root_dir, base_dir in scan_roots:
+            subfolders = [root_dir]
+            for path in subfolders:
+                if self.cancel_scan_flag.is_set() or time.perf_counter() - start_time > wait_time:
+                    break
+                stats_dict = concept_stats.folder_scan(
+                    path,
+                    stats_dict,
+                    advanced_checks,
+                    self.concept,
+                    start_time,
+                    wait_time,
+                    self.cancel_scan_flag,
+                    base_dir=base_dir,
+                )
+                if self.concept.include_subdirectories and not self.cancel_scan_flag.is_set():
+                    subfolders.extend([f.path for f in os.scandir(path) if f.is_dir() and not f.name.startswith('.')])
+                self.concept.concept_stats = stats_dict
+                if time.perf_counter() > (last_update + 0.5):
+                    last_update = time.perf_counter()
+                    view.components.call_after(view.concept_stats_tab, 0, lambda: view._update_concept_stats(self))
             if self.cancel_scan_flag.is_set() or time.perf_counter() - start_time > wait_time:
                 break
-            stats_dict = concept_stats.folder_scan(path, stats_dict, advanced_checks, self.concept, start_time, wait_time, self.cancel_scan_flag)
-            if self.concept.include_subdirectories and not self.cancel_scan_flag.is_set():     #add all subfolders of current directory to for loop
-                subfolders.extend([f for f in os.scandir(path) if f.is_dir() and not f.name.startswith('.')])
+
+        if is_slider and not self.cancel_scan_flag.is_set():
+            concept_stats.update_slider_stats(
+                stats_dict,
+                concept_path,
+                negative_path,
+                self.concept.include_subdirectories,
+                check_dimensions=advanced_checks,
+            )
+            stats_dict["processing_time"] = time.perf_counter() - start_time
             self.concept.concept_stats = stats_dict
-            #update GUI approx every half second
-            if time.perf_counter() > (last_update + 0.5):
-                last_update = time.perf_counter()
-                view.components.call_after(view.concept_stats_tab, 0, lambda: view._update_concept_stats(self))
 
         self.cancel_scan_flag.clear()
         view.components.call_after(view.concept_stats_tab, 0, view._enable_scan_buttons)
@@ -267,10 +313,48 @@ class ConceptWindowController:
         self.scan_thread = threading.Thread(target=self.get_concept_stats, args=[view, advanced_checks, waittime], daemon=True)
         self.scan_thread.start()
 
+    def validate_slider_pairs(self, view):
+        start_time = time.perf_counter()
+        self.cancel_scan_flag.clear()
+        view.components.call_after(view.concept_stats_tab, 0, view._disable_scan_buttons)
+        try:
+            pos_dir = self.get_concept_path(self.concept.path)
+            neg_dir = self.get_concept_path(self.concept.negative_path)
+            validation = concept_stats.validate_slider_concept(
+                pos_dir,
+                neg_dir,
+                self.concept.include_subdirectories,
+                concept_name=self.concept.name or self.concept.path,
+            )
+            stats_dict = dict(self.concept.concept_stats) if isinstance(self.concept.concept_stats, dict) else {}
+            if "file_size" not in stats_dict:
+                stats_dict = concept_stats.init_concept_stats(False)
+            stats_dict["slider_found_pairs"] = validation["found_pairs"]
+            stats_dict["slider_unmatched_pairs"] = validation["unmatched_pairs"]
+            stats_dict["slider_matching_pairs"] = validation["matching_pairs"]
+            stats_dict["slider_dimension_mismatches"] = validation["dimension_mismatches"]
+            stats_dict["slider_validation_status"] = validation["summary"]
+            stats_dict["processing_time"] = time.perf_counter() - start_time
+            self.concept.concept_stats = stats_dict
+
+            if not self.cancel_scan_flag.is_set():
+                view.components.call_after(view.concept_stats_tab, 0, lambda: view._update_concept_stats(self))
+                view.components.call_after(
+                    view.concept_stats_tab, 0, lambda v=validation: view._show_slider_validation_result(v)
+                )
+        finally:
+            view.components.call_after(view.concept_stats_tab, 0, view._enable_scan_buttons)
+
+    def validate_slider_pairs_threaded(self, view):
+        thread = threading.Thread(target=self.validate_slider_pairs, args=[view], daemon=True)
+        thread.start()
+
     def auto_update_concept_stats(self, view):
         try:
             view._update_concept_stats(self)      #load stats from config if available, else raises KeyError
             if self.concept.concept_stats["file_size"] == 0:  #force rescan if empty
+                raise KeyError
+            if ConceptType(self.concept.type) == ConceptType.SLIDER and self.concept.concept_stats.get("slider_found_pairs", "-") == "-":
                 raise KeyError
         except KeyError:
             concept_path = self.get_concept_path(self.concept.path)

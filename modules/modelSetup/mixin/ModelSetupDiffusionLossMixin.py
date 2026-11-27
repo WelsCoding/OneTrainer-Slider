@@ -32,6 +32,16 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         loss = diff + torch.nn.functional.softplus(-2.0*diff) - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
         return loss
 
+    @staticmethod
+    def __apply_slider_weight(losses: Tensor, batch: dict) -> Tensor:
+        slider_weight = batch.get('slider_weight')
+        if slider_weight is None:
+            return losses
+        w = slider_weight.to(device=losses.device, dtype=losses.dtype)
+        while w.ndim < losses.ndim:
+            w = w.unsqueeze(2)
+        return losses * w
+
     def __masked_losses(
             self,
             batch: dict,
@@ -44,7 +54,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         # MSE/L2 Loss
         if config.mse_strength != 0:
-            losses += masked_losses_with_prior(
+            losses += self.__apply_slider_weight(masked_losses_with_prior(
                 losses=F.mse_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32),
@@ -59,11 +69,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
                 masked_prior_preservation_weight=config.masked_prior_preservation_weight,
-            ).mean(mean_dim) * config.mse_strength
+            ), batch).mean(mean_dim) * config.mse_strength
 
         # MAE/L1 Loss
         if config.mae_strength != 0:
-            losses += masked_losses_with_prior(
+            losses += self.__apply_slider_weight(masked_losses_with_prior(
                 losses=F.l1_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32),
@@ -78,11 +88,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
                 masked_prior_preservation_weight=config.masked_prior_preservation_weight,
-            ).mean(mean_dim) * config.mae_strength
+            ), batch).mean(mean_dim) * config.mae_strength
 
         # log-cosh Loss
         if config.log_cosh_strength != 0:
-            losses += masked_losses_with_prior(
+            losses += self.__apply_slider_weight(masked_losses_with_prior(
                 losses=self.__log_cosh_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32)
@@ -95,11 +105,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
                 masked_prior_preservation_weight=config.masked_prior_preservation_weight,
-            ).mean(mean_dim) * config.log_cosh_strength
+            ), batch).mean(mean_dim) * config.log_cosh_strength
 
         # Huber Loss
         if config.huber_strength != 0:
-            losses += masked_losses_with_prior(
+            losses += self.__apply_slider_weight(masked_losses_with_prior(
                 losses=F.huber_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32),
@@ -116,11 +126,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
                 masked_prior_preservation_weight=config.masked_prior_preservation_weight,
-            ).mean(mean_dim) * config.huber_strength
+            ), batch).mean(mean_dim) * config.huber_strength
 
         # VB loss
         if config.vb_loss_strength != 0 and 'predicted_var_values' in data and self.__coefficients is not None:
-            losses += masked_losses(
+            losses += self.__apply_slider_weight(masked_losses(
                 losses=vb_losses(
                     coefficients=self.__coefficients,
                     x_0=data['scaled_latent_image'].to(dtype=torch.float32),
@@ -132,7 +142,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 mask=batch['latent_mask'].to(dtype=torch.float32),
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean(mean_dim) * config.vb_loss_strength
+            ), batch).mean(mean_dim) * config.vb_loss_strength
 
         return losses
 
@@ -148,46 +158,46 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         # MSE/L2 Loss
         if config.mse_strength != 0:
-            losses += F.mse_loss(
+            losses += self.__apply_slider_weight(F.mse_loss(
                 data['predicted'].to(dtype=torch.float32),
                 data['target'].to(dtype=torch.float32),
                 reduction='none'
-            ).mean(mean_dim) * config.mse_strength
+            ), batch).mean(mean_dim) * config.mse_strength
 
         # MAE/L1 Loss
         if config.mae_strength != 0:
-            losses += F.l1_loss(
+            losses += self.__apply_slider_weight(F.l1_loss(
                 data['predicted'].to(dtype=torch.float32),
                 data['target'].to(dtype=torch.float32),
                 reduction='none'
-            ).mean(mean_dim) * config.mae_strength
+            ), batch).mean(mean_dim) * config.mae_strength
 
         # log-cosh Loss
         if config.log_cosh_strength != 0:
-            losses += self.__log_cosh_loss(
+            losses += self.__apply_slider_weight(self.__log_cosh_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32)
-                ).mean(mean_dim) * config.log_cosh_strength
+                ), batch).mean(mean_dim) * config.log_cosh_strength
 
         # Huber Loss
         if config.huber_strength != 0:
-            losses += F.huber_loss(
+            losses += self.__apply_slider_weight(F.huber_loss(
                 data['predicted'].to(dtype=torch.float32),
                 data['target'].to(dtype=torch.float32),
                 reduction='none',
                 delta=config.huber_delta,
-            ).mean(mean_dim) * config.huber_strength
+            ), batch).mean(mean_dim) * config.huber_strength
 
         # VB loss
         if config.vb_loss_strength != 0 and 'predicted_var_values' in data:
-            losses += vb_losses(
+            losses += self.__apply_slider_weight(vb_losses(
                 coefficients=self.__coefficients,
                 x_0=data['scaled_latent_image'].to(dtype=torch.float32),
                 x_t=data['noisy_latent_image'].to(dtype=torch.float32),
                 t=data['timestep'],
                 predicted_eps=data['predicted'].to(dtype=torch.float32),
                 predicted_var_values=data['predicted_var_values'].to(dtype=torch.float32),
-            ).mean(mean_dim) * config.vb_loss_strength
+            ), batch).mean(mean_dim) * config.vb_loss_strength
 
         if config.masked_training and config.normalize_masked_area_loss:
             clamped_mask = torch.clamp(batch['latent_mask'], config.unmasked_weight, 1)

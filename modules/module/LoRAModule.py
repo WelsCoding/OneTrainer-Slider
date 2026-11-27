@@ -7,7 +7,7 @@ from typing import Any
 
 from modules.module.FusedModule import FusedModuleGroup, check_fusion_match, discover_fused_groups
 from modules.module.oft_utils import OFTRotationModule
-from modules.module.quantized.LinearSVD import BaseLinearSVD
+from modules.module.quantized.mixin.LoRAFusableLinearMixin import LoRAFusableLinearMixin
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import PeftType
 from modules.util.lokr_utils import factorization, make_kron, rebuild_tucker
@@ -37,8 +37,11 @@ class PeftBase(nn.Module):
         self.is_applied = False
         self.layer_kwargs = {}
         self._initialized = False
+        self.register_buffer("multiplier", torch.tensor(1.0), persistent=False)
+        self.multiplier.requires_grad_(False)
 
         if orig_module is not None:
+            self.multiplier = self.multiplier.to(orig_module.weight.device)
             match orig_module:
                 case nn.Linear():
                     self.op = F.linear
@@ -114,6 +117,16 @@ class PeftBase(nn.Module):
         # peft types that recompose the base weight itself (DoRA, OFT, LoKr-decompose), which must keep
         # going through the fused forward.
         return None
+
+    def fused_leaf_forward(self, leaf: nn.Module, x, start: int, end: int) -> Tensor | None:
+        # Returns one leaf's complete output (base + this adapter's contribution) when the leaf can
+        # fold the adapter into its own base matmul, so no delta is computed or added separately.
+        # start/end are the leaf's row range in the fused output. Returns None (the default) when no
+        # such path exists, and the caller falls back to delta_forward.
+        return None
+
+    def set_multiplier(self, multiplier: float):
+        self.multiplier.fill_(multiplier)
 
     @property
     def orig_module(self) -> nn.Module:
@@ -286,7 +299,7 @@ class LoHaModule(PeftBase):
                               self.dropout(self.hada_w1_a))
         W2 = self.make_weight(self.dropout(self.hada_w2_b),
                               self.dropout(self.hada_w2_a))
-        W = (W1 * W2) * (self.alpha / self.rank)
+        W = (W1 * W2) * ((self.alpha * self.multiplier) / self.rank)
         return self.op(x, W, bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
@@ -475,7 +488,7 @@ class LoKrModule(PeftBase):
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
 
-        scale = self.alpha / self.dim
+        scale = (self.alpha * self.multiplier) / self.dim
 
         # DoRA for LoKr
         if self.weight_decompose:
@@ -570,15 +583,26 @@ class LoRAModule(PeftBase):
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
-        if isinstance(self.orig_module, BaseLinearSVD):
-            return self.orig_module.forward_with_lora(x, self.lora_down, self.lora_up, self.dropout, self.alpha)
+        if isinstance(self.orig_module, LoRAFusableLinearMixin):
+            return self.orig_module.forward_with_lora(
+                x, self.lora_down.weight, self.lora_up.weight, self.dropout, self.alpha * self.multiplier
+            )
 
         return self.orig_forward(x) + self.delta_forward(x, *args, **kwargs)
+
+    def fused_leaf_forward(self, leaf: nn.Module, x, start: int, end: int) -> Tensor | None:
+        self.check_initialized()
+        if not isinstance(leaf, LoRAFusableLinearMixin):
+            return None
+        #the fused adapter's up spans all leaves' concatenated outputs; narrow it to this leaf's rows
+        return leaf.forward_with_lora(
+            x, self.lora_down.weight, self.lora_up.weight[start:end], self.dropout, self.alpha * self.multiplier
+        )
 
     def delta_forward(self, x, *args, **kwargs) -> Tensor | None:
         self.check_initialized()
         ld = self.lora_up(self.dropout(self.lora_down(x)))
-        return ld * (self.alpha / self.rank)
+        return ld * ((self.alpha * self.multiplier) / self.rank)
 
     def apply_to_module(self):
         # TODO
@@ -595,15 +619,29 @@ class OFTModule(PeftBase):
     oft_block_size: int
     block_share: bool
     oft_scaled: bool
+    oft_clipped_norm: float | None
+    use_matrix_exp: bool
     dropout_probability: float
     adjustment_info: tuple[int, int] | None # for reporting
 
-    def __init__(self, prefix: str, orig_module: nn.Module | None, oft_block_size: int, block_share: bool, oft_scaled: bool, **kwargs):
+    def __init__(
+        self,
+        prefix: str,
+        orig_module: nn.Module | None,
+        oft_block_size: int,
+        block_share: bool,
+        oft_scaled: bool,
+        oft_clipped_norm: float | None = None,
+        use_matrix_exp: bool = False,
+        **kwargs,
+    ):
         super().__init__(prefix, orig_module)
         self.oft_block_size = oft_block_size
         self.rank = 0
         self.block_share = block_share
         self.oft_scaled = oft_scaled
+        self.oft_clipped_norm = oft_clipped_norm
+        self.use_matrix_exp = use_matrix_exp
         self.dropout_probability = kwargs.pop('dropout_probability', 0.0)
         self.oft_R = None
         self.adjustment_info = None
@@ -671,8 +709,9 @@ class OFTModule(PeftBase):
             block_share=self.block_share,
             oft_scaled=self.oft_scaled,
             use_cayley_neumann=True,
-            num_cayley_neumann_terms=5,
+            use_matrix_exp=self.use_matrix_exp,
             dropout_probability=self.dropout_probability,
+            oft_clipped_norm=self.oft_clipped_norm,
         )
 
         nn.init.zeros_(self.oft_R.weight)
@@ -682,15 +721,15 @@ class OFTModule(PeftBase):
 
         # For Linear layers, rotating the input is mathematically equivalent to rotating the weights.
         if isinstance(self.orig_module, nn.Linear):
-            rotated_x = self.oft_R(x)
+            rotated_x = self.oft_R(x, multiplier=self.multiplier)
             return self.orig_forward(rotated_x, *args, **kwargs)
 
         scaling_factor = 2 * math.sqrt(self.oft_R.block_size - 1) if self.oft_scaled else 1
-        effective_weight = self.oft_R.weight / scaling_factor
+        effective_weight = (self.oft_R.weight * self.multiplier.to(self.oft_R.weight.dtype)) / scaling_factor
 
         # For Conv2d, we must rotate the weights, not the input, to preserve spatial information.
         orth_rotate = self.oft_R._cayley_batch(
-            effective_weight, self.oft_R.block_size, self.oft_R.use_cayley_neumann, self.oft_R.num_cayley_neumann_terms
+            effective_weight, self.oft_R.block_size, self.oft_R.use_cayley_neumann, self.oft_R.use_matrix_exp
         )
         orth_rotate = self.oft_R.dropout(orth_rotate)
 
@@ -720,6 +759,78 @@ class OFTModule(PeftBase):
     @property
     def dropout(self):
         return self.oft_R.dropout
+
+
+class DoRAOFTModule(OFTModule):
+    """
+    DoRA applied to OFT.
+    Since OFT (Orthogonal Finetuning) applies a rotation R such that W_new = W_orig @ R^T,
+    and R is orthogonal, the norm of the weight rows (output features) is preserved.
+    ||W_new|| = ||W_orig||.
+    """
+    dora_log_multiplier: nn.Parameter | None
+    _dropout: nn.Dropout
+
+    @property
+    def dropout(self) -> nn.Dropout:
+        # DoRA-OFT drops out the input x (standard DoRA style) rather than using
+        # OFT's multiplicative block dropout
+        return self._dropout
+
+    def __init__(self, *args, **kwargs):
+        self.dora_log_multiplier = None
+        super().__init__(*args, **kwargs)
+        self._dropout = Dropout(0)
+        self.oft_R.dropout.p = 0.0
+
+    def initialize_weights(self):
+        super().initialize_weights()
+
+        # Calculate multiplier shape
+        out_dim = self.shape[0]
+        multiplier_shape = (out_dim,)
+
+        # Initialize dora_log_multiplier to 0.0 (exp(0) = 1.0 multiplier)
+        self.dora_log_multiplier = nn.Parameter(
+            torch.zeros(
+                multiplier_shape,
+                device=self.orig_module.weight.device
+            )
+        )
+
+    def check_initialized(self):
+        super().check_initialized()
+        assert self.dora_log_multiplier is not None
+
+    def forward(self, x, *args, **kwargs):
+        # Get the standard OFT output
+        # result = W_orig @ R^T @ x + bias
+        result = super().forward(self.dropout(x), *args, **kwargs)
+
+        # Apply Exponential DoRA Scale (exp(0) = Multiplies by 1.0 at step 0)
+        multiplier = torch.exp(
+            self.dora_log_multiplier * self.multiplier.to(self.dora_log_multiplier.dtype)
+        ).to(result.dtype)
+        if isinstance(self.orig_module, nn.Conv2d):
+            # Broadcast over spatial dimensions for both batched and unbatched inputs.
+            multiplier = multiplier.view(-1, 1, 1)
+
+        bias = self.orig_module.bias
+        if bias is not None:
+            # autocast can produce fp16/bf16 output from an fp32 base layer. keep the
+            # bias correction in that output dtype to avoid promoting the full activation.
+            bias = bias.to(result.dtype)
+            bias_view = bias.view(-1, 1, 1) if isinstance(self.orig_module, nn.Conv2d) else bias
+
+            # This is equivalent to (result - bias) * m + bias, but
+            # eliminates VRAM overhead by calculating the bias shift on the tiny bias tensor.
+            # y_{dora} = y * m + b * (1 - m)
+            bias_term = bias_view * (1.0 - multiplier)
+            result = result * multiplier + bias_term
+        else:
+            result = result * multiplier
+
+        return result
 
 
 class DoRAModule(LoRAModule):
@@ -781,6 +892,11 @@ class DoRAModule(LoRAModule):
         # DoRA scales the recomposed weight, so there is no delta term; back to None from LoRAModule's.
         return None
 
+    def fused_leaf_forward(self, leaf: nn.Module, x, start: int, end: int) -> Tensor | None:
+        # same reason as delta_forward: the leaf folds an additive term into its own base matmul,
+        # and DoRA recomposes the weight instead
+        return None
+
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
         A = self.lora_down.weight
@@ -792,7 +908,7 @@ class DoRAModule(LoRAModule):
             assert isinstance(self.orig_module, nn.Conv2d)
             orig_weight = self.orig_module.weight.detach().float()
 
-        WP = orig_weight + (self.make_weight(A, B) * (self.alpha / self.rank))
+        WP = orig_weight + (self.make_weight(A, B) * ((self.alpha * self.multiplier) / self.rank))
         del orig_weight
         # A norm should never really end up zero at any point, but epsilon just
         # to be safe if we underflow or something. Also, as per section 4.3 of
@@ -827,6 +943,7 @@ DummyLoRAModule = LoRAModule.make_dummy()
 DummyDoRAModule = DoRAModule.make_dummy()
 DummyLoHaModule = LoHaModule.make_dummy()
 DummyOFTModule = OFTModule.make_dummy()
+DummyDoRAOFTModule = DoRAOFTModule.make_dummy()
 DummyLoKrModule = LoKrModule.make_dummy()
 
 
@@ -892,12 +1009,19 @@ class LoRAModuleWrapper:
             self.additional_args = [self.rank, self.alpha]
             self.additional_kwargs = {}
         elif self.peft_type == PeftType.OFT_2:
-            self.klass = OFTModule
-            self.dummy_klass = DummyOFTModule
+            if config.dora_oft:
+                self.klass = DoRAOFTModule
+                self.dummy_klass = DummyDoRAOFTModule
+            else:
+                self.klass = OFTModule
+                self.dummy_klass = DummyOFTModule
+
             self.additional_args = [
                 config.oft_block_size,
                 config.oft_block_share,
                 config.oft_scaled,
+                config.oft_clipped_norm,
+                config.oft_matrix_exp,
             ]
             self.additional_kwargs = {
                 'dropout_probability': config.dropout_probability,
@@ -1134,3 +1258,10 @@ class LoRAModuleWrapper:
             raise ValueError("Dropout probability must be in [0, 1]")
         for module in self.lora_modules.values():
             module.dropout.p = dropout_probability
+
+    def set_multiplier(self, multiplier: float):
+        """
+        Sets the adapter forward multiplier for all wrapped modules
+        """
+        for module in self.lora_modules.values():
+            module.set_multiplier(multiplier)

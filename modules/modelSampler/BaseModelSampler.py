@@ -1,7 +1,10 @@
+import copy
 import io
 import os
+import random
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 from modules.util.config.SampleConfig import SampleConfig
@@ -9,6 +12,7 @@ from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.VideoFormat import VideoFormat
+from modules.util.slider_util import stitch_slider_images, stitch_slider_videos
 
 import torch
 
@@ -59,6 +63,16 @@ class BaseModelSampler(metaclass=ABCMeta):
 
         self.train_device = train_device
         self.temp_device = temp_device
+        self._suppress_save = False
+
+    @contextmanager
+    def _suppress_saving(self):
+        previous = self._suppress_save
+        self._suppress_save = True
+        try:
+            yield
+        finally:
+            self._suppress_save = previous
 
     @abstractmethod
     def sample(
@@ -73,12 +87,129 @@ class BaseModelSampler(metaclass=ABCMeta):
     ):
         pass
 
+    def sample_all(
+            self,
+            sample_configs: list[SampleConfig],
+            destinations: list[str],
+            image_format: ImageFormat | None = None,
+            video_format: VideoFormat | None = None,
+            audio_format: AudioFormat | None = None,
+            on_update_progress: Callable[[int, int], None] = lambda _, __: None,
+    ) -> list[ModelSamplerOutput]:
+        # Item-major fallback for samplers not split into pipeline stages: run each sample
+        # end to end, cycling this model's parts on-device once per sample instead of once
+        # per batch. Progress restarts at each sample, matching how these samplers reported
+        # when the trainer still sampled one at a time. Samplers that define stages override
+        # this with run_staged_pipeline.
+        sampler_outputs = []
+        model = getattr(self, "model", None)
+        for sample_config, destination in zip(sample_configs, destinations, strict=True):
+            try:
+                if model is not None:
+                    model.set_adapter_multiplier(getattr(sample_config, "slider_multiplier", 1.0))
+                self.sample(
+                    sample_config, destination,
+                    image_format, video_format, audio_format,
+                    on_sample=sampler_outputs.append,
+                    on_update_progress=on_update_progress,
+                )
+            finally:
+                if model is not None:
+                    model.set_adapter_multiplier(1.0)
+        return sampler_outputs
+
+    def sample_slider_all(
+            self,
+            sample_configs: list[SampleConfig],
+            destinations: list[str],
+            image_format: ImageFormat | None = None,
+            video_format: VideoFormat | None = None,
+            audio_format: AudioFormat | None = None,
+            multipliers: tuple[float, ...] = (-1.0, 1.0),
+            on_update_progress: Callable[[int, int], None] = lambda _, __: None,
+    ) -> list[ModelSamplerOutput]:
+        if not sample_configs:
+            return []
+
+        expanded_configs: list[SampleConfig] = []
+        expanded_destinations: list[str] = []
+        for sample_config, destination in zip(sample_configs, destinations, strict=True):
+            resolved_seed = (
+                random.randint(0, 2**31 - 1) if sample_config.random_seed else sample_config.seed
+            )
+            for multiplier in multipliers:
+                pole_config = copy.copy(sample_config)
+                pole_config.random_seed = False
+                pole_config.seed = resolved_seed
+                pole_config.slider_multiplier = multiplier
+                expanded_configs.append(pole_config)
+                expanded_destinations.append(destination)
+
+        with self._suppress_saving():
+            pole_outputs = self.sample_all(
+                expanded_configs,
+                expanded_destinations,
+                image_format,
+                video_format,
+                audio_format,
+                on_update_progress=on_update_progress,
+            )
+
+        num_poles = len(multipliers)
+        fps = getattr(getattr(self, "model", None), "NATIVE_FPS", 24)
+        stitched_outputs: list[ModelSamplerOutput] = []
+        for idx, destination in enumerate(destinations):
+            group = pole_outputs[idx * num_poles:(idx + 1) * num_poles]
+            if group[0].file_type == FileType.IMAGE:
+                stitched = ModelSamplerOutput(
+                    file_type=FileType.IMAGE,
+                    data=stitch_slider_images([o.data for o in group], multipliers=multipliers),
+                )
+            elif group[0].file_type == FileType.VIDEO:
+                stitched = ModelSamplerOutput(
+                    file_type=FileType.VIDEO,
+                    data=stitch_slider_videos([o.data for o in group]),
+                )
+            else:
+                stitched = group[-1]
+
+            self.save_sampler_output(
+                stitched,
+                destination,
+                image_format,
+                video_format,
+                audio_format,
+                fps=fps,
+            )
+            stitched_outputs.append(stitched)
+
+        return stitched_outputs
+
     @staticmethod
     def quantize_resolution(resolution: int, quantization: int) -> int:
         return round(resolution / quantization) * quantization
 
     @staticmethod
+    def batch_progress_callback(
+            sample_configs: list[SampleConfig],
+            on_update_progress: Callable[[int, int], None],
+    ) -> Callable[[int, int], None]:
+        # denoise reports its own per-sample step count; the staged pipeline denoises
+        # every sample before any decode, so translate those into one continuous bar
+        # spanning the whole batch rather than restarting at each sample
+        total_steps = sum(sample_config.diffusion_steps for sample_config in sample_configs)
+        completed_steps = 0
+
+        def batch_progress(step: int, sample_steps: int):
+            nonlocal completed_steps
+            on_update_progress(completed_steps + step, total_steps)
+            if step == sample_steps:
+                completed_steps += sample_steps
+
+        return batch_progress
+
     def save_sampler_output(
+            self,
             sampler_output: ModelSamplerOutput,
             destination: str,
             image_format: ImageFormat | None,
@@ -86,6 +217,8 @@ class BaseModelSampler(metaclass=ABCMeta):
             audio_format: AudioFormat | None,
             fps: int = 24,
     ):
+        if self._suppress_save:
+            return
         os.makedirs(Path(destination).parent.absolute(), exist_ok=True)
 
         if sampler_output.file_type == FileType.IMAGE:
