@@ -104,6 +104,12 @@ class GenericTrainer(BaseTrainer):
 
             if self.config.clear_cache_before_training and self.config.latent_caching:
                 self.__clear_cache()
+            elif self.config.latent_caching:
+                # A cache written by a buggy image loader (mgds #63 double-normalized every image into
+                # [-1.0, -0.992]) keeps returning solid black latents, because the cache key is built from
+                # the concept settings only, not from the loader code. Slider training is where that is
+                # impossible to miss, so warn here when the stale cache is about to be reused.
+                self.__warn_if_stale_slider_cache()
 
         if self.config.train_dtype.enable_tf():
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -200,6 +206,22 @@ class GenericTrainer(BaseTrainer):
                 path = os.path.join(self.config.cache_dir, filename)
                 if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
                     shutil.rmtree(path)
+
+    def __warn_if_stale_slider_cache(self):
+        if not self.config.has_slider_concepts():
+            return
+        image_cache_dir = os.path.join(self.config.cache_dir, "image")
+        if not os.path.isdir(image_cache_dir):
+            return
+        if not any(os.path.isdir(os.path.join(image_cache_dir, name)) for name in os.listdir(image_cache_dir)):
+            return
+        print(
+            "[Slider] WARNING: reusing the existing latent cache in "
+            f"'{image_cache_dir}'. Caches written before the image loading fix (mgds #63, OneTrainer "
+            "mgds bump) contain solid black latents, and the cache key does not change when the loader "
+            "is fixed. Enable 'Clear Cache Before Training', or delete that directory, to retrain from "
+            "the real images."
+        )
 
     def __prune_backups(self, backups_to_keep: int):
         for dirpath in self.config.get_backup_paths()[backups_to_keep:]:

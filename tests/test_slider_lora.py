@@ -54,11 +54,14 @@ def _ensure_qt_headless_stub() -> None:
 
 _ensure_qt_headless_stub()
 
+import modules.dataLoader.LoadImage as load_image_module
 from modules.dataLoader.BaseDataLoader import _slider_safe_collate
+from modules.dataLoader.LoadImage import LoadImage
 from modules.dataLoader.mixin.DataLoaderMgdsMixin import DataLoaderMgdsMixin
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.dataLoader.SliderDataModules import (
     CollectSliderPaths,
+    OptionalEncodeVAE,
     OptionalImageToVideo,
     OptionalLoadImage,
     OptionalLoadVideo,
@@ -134,6 +137,7 @@ from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipe
 import torch
 from torch import nn
 
+import numpy as np
 import pytest
 from PIL import Image
 from safetensors.torch import save_file
@@ -1046,3 +1050,193 @@ def test_ui_filter_and_train_controller_slider_validation(tmp_path: Path):
     assert len(validation_seen) == 1
     assert validation_seen[0]["valid"] is True
     assert validation_seen[0]["matching_pairs"] == 1
+
+
+def _run_load_image_pipeline(image_path: Path, *, range_min=0.0, range_max=1.0, dtype=None):
+    """Run a one-image LoadingPipeline through OneTrainer's LoadImage and return the output tensor."""
+    pipeline = LoadingPipeline(
+        device=torch.device("cpu"),
+        modules=[
+            _DictListModule("image_path", [str(image_path)]),
+            LoadImage("image_path", "image", range_min, range_max, {".png", ".jpg"}, dtype=dtype),
+            OutputPipelineModule(["image"]),
+        ],
+        batch_size=1,
+        seed=1,
+        state=PipelineState(max_threads=1),
+    )
+    pipeline.start_next_epoch()
+    return next(pipeline)["image"]
+
+
+def test_load_image_preserves_image_range_and_avoids_double_normalization(tmp_path: Path):
+    """Regression test for the doubled /255 in the pinned mgds LoadImage (mgds #63 / OneTrainer #1790).
+
+    With the duplicated normalization every image came out as [0, 1/255], which RescaleImageChannels
+    then mapped to [-1.0, -0.992]: all training images (slider +1 and -1 poles included) reached the
+    VAE as solid black, so a Slider LoRA could only learn from identical black latents.
+    """
+    # torchvision path (the normal path for png/jpg)
+    _save_png(tmp_path / "rgb.png", (8, 8), (240, 20, 120))
+    loaded = _run_load_image_pipeline(tmp_path / "rgb.png")
+    assert loaded.shape == (3, 8, 8)
+    assert loaded.dtype == torch.float32
+    # values must be the real 8-bit values scaled once into [0, 1]
+    torch.testing.assert_close(loaded[:, 0, 0], torch.tensor([240.0, 20.0, 120.0]) / 255.0, rtol=0, atol=1e-6)
+    assert loaded.min() >= 0.0
+    assert loaded.max() > 0.9
+
+    # range scaling is applied exactly once, not twice
+    _save_png(tmp_path / "white.png", (4, 4), (255, 255, 255))
+    white = _run_load_image_pipeline(tmp_path / "white.png", range_min=-1.0, range_max=1.0)
+    assert float(white.max()) == pytest.approx(1.0)
+    _save_png(tmp_path / "black.png", (4, 4), (0, 0, 0))
+    black = _run_load_image_pipeline(tmp_path / "black.png", range_min=-1.0, range_max=1.0)
+    assert float(black.min()) == pytest.approx(-1.0)
+
+    # a mid gray image must stay mid gray instead of collapsing into black
+    _save_png(tmp_path / "gray.png", (4, 4), (128, 128, 128))
+    gray = _run_load_image_pipeline(tmp_path / "gray.png", range_min=-1.0, range_max=1.0)
+    assert float(gray.mean()) == pytest.approx(128.0 / 255.0 * 2.0 - 1.0, abs=2e-3)
+
+    # a downscaled dtype (bfloat16) keeps the same range
+    bf16_loaded = _run_load_image_pipeline(tmp_path / "rgb.png", dtype=torch.bfloat16)
+    assert bf16_loaded.dtype == torch.bfloat16
+    torch.testing.assert_close(bf16_loaded, loaded.to(dtype=torch.bfloat16), rtol=0, atol=0)
+
+
+def test_load_image_pillow_fallback_matches_torchvision(tmp_path: Path, monkeypatch):
+    """The Pillow fallback had the same duplicated normalization plus a repeated convert/ToTensor."""
+    _save_png(tmp_path / "rgb.png", (8, 8), (240, 20, 120))
+    torchvision_result = _run_load_image_pipeline(tmp_path / "rgb.png")
+
+    def _raise_runtime_error(*_args, **_kwargs):
+        # the loader falls back to Pillow on RuntimeError from the torchvision decoder
+        raise RuntimeError("forced pillow fallback")
+
+    monkeypatch.setattr(load_image_module, "read_image", _raise_runtime_error)
+    pillow_result = _run_load_image_pipeline(tmp_path / "rgb.png")
+    torch.testing.assert_close(pillow_result, torchvision_result, rtol=0, atol=0)
+
+
+def test_load_image_reads_16bit_images_as_8bit_range(tmp_path: Path):
+    """16-bit samples are normalized by their dtype max (mgds #55), then scaled once."""
+    data = np.arange(16, dtype=np.uint16).reshape(4, 4) * 4000
+    image = Image.fromarray(data)
+    assert image.mode == "I;16"
+    path = tmp_path / "gray16.png"
+    image.save(path)
+
+    loaded = _run_load_image_pipeline(path)
+    assert loaded.shape == (3, 4, 4)
+    assert float(loaded.min()) == pytest.approx(0.0)
+    assert float(loaded.max()) == pytest.approx(float(data.max()) / 65535.0, abs=1e-6)
+
+
+def test_slider_pos_and_neg_latents_differ_after_vae_encoding(tmp_path: Path):
+    """End-to-end guard for the bug: distinct +1/-1 images must produce distinct VAE latents.
+
+    With the doubled /255 both images were already identical black before the VAE, so the latent
+    difference was zero. The slider diff weight then had nothing to weight, and both poles of the
+    LoRA were trained on the same (black) target.
+    """
+    pos_path = tmp_path / "pos.png"
+    neg_path = tmp_path / "neg.png"
+    _save_png(pos_path, (64, 64), (240, 20, 20))
+    _save_png(neg_path, (64, 64), (20, 20, 240))
+
+    class _DeterministicDistribution:
+        # carries the "encoded" tensor straight through the "mean" sampling mode
+        def __init__(self, mean):
+            self._mean = mean
+
+        def mode(self):
+            return self._mean
+
+        def sample(self):
+            return self._mean
+
+    class _IdentityVAE:
+        def encode(self, x):
+            # a deterministic "encoder" that keeps the pixel statistics visible in the latent
+            return types.SimpleNamespace(latent_dist=_DeterministicDistribution(x))
+
+    def encode(image_path: Path) -> torch.Tensor:
+        pipeline = LoadingPipeline(
+            device=torch.device("cpu"),
+            modules=[
+                _DictListModule("image_path", [str(image_path)]),
+                LoadImage("image_path", "image", 0, 1, {".png"}),
+                RescaleImageChannels("image", "image", 0, 1, -1, 1),
+                OptionalEncodeVAE(
+                    in_name="image",
+                    out_name="latent_image_distribution",
+                    vae=_IdentityVAE(),
+                    autocast_contexts=[nullcontext()],
+                    dtype=torch.float32,
+                ),
+                OptionalSampleVAEDistribution("latent_image_distribution", "latent_image", "mean"),
+                OutputPipelineModule(["latent_image"]),
+            ],
+            batch_size=1,
+            seed=1,
+            state=PipelineState(max_threads=1),
+        )
+        pipeline.start_next_epoch()
+        return next(pipeline)["latent_image"]
+
+    pos_latent = encode(pos_path)
+    neg_latent = encode(neg_path)
+
+    # the bug collapsed both training images into the single, all-but-black range [-1.0, -0.992]
+    for latent in (pos_latent, neg_latent):
+        assert float(latent.min()) < -0.5, "image collapsed into the near-black range [-1.0, -0.992]"
+        assert float(latent.max()) > 0.5, "image collapsed into the near-black range [-1.0, -0.992]"
+    assert float((pos_latent - neg_latent).abs().mean()) > 0.1
+
+    # and the slider diff weighting sees a real (non-degenerate) difference map
+    weight = compute_slider_diff_weight(
+        types.SimpleNamespace(model_type=None, vae=None),
+        pos_latent.unsqueeze(0),
+        neg_latent.unsqueeze(0),
+        1.0,
+    )
+    assert weight is not None
+    assert weight.shape[-2:] == (64, 64)
+    assert float(weight.mean()) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_stale_slider_cache_warning(tmp_path: Path, capsys):
+    """A cache filled while the loader bug was live must not be reused silently."""
+    trainer = GenericTrainer.__new__(GenericTrainer)
+    trainer.config = TrainConfig.default_values()
+    trainer.config.cache_dir = str(tmp_path)
+    trainer.config.latent_caching = True
+
+    # no slider concept -> nothing to warn about
+    trainer._GenericTrainer__warn_if_stale_slider_cache()
+    assert "[Slider]" not in capsys.readouterr().out
+
+    slider = ConceptConfig.default_values()
+    slider.name = "age"
+    slider.type = ConceptType.SLIDER
+    slider.path = str(tmp_path / "pos")
+    slider.negative_path = str(tmp_path / "neg")
+    trainer.config.concepts = [slider]
+
+    # no cache yet -> nothing to warn about
+    trainer._GenericTrainer__warn_if_stale_slider_cache()
+    assert "[Slider]" not in capsys.readouterr().out
+
+    # an empty cache root -> nothing to warn about yet
+    (tmp_path / "image").mkdir()
+    trainer._GenericTrainer__warn_if_stale_slider_cache()
+    assert "[Slider]" not in capsys.readouterr().out
+
+    # a populated cache -> warn, naming the directory and the fix
+    (tmp_path / "image" / "epoch-0").mkdir()
+    trainer._GenericTrainer__warn_if_stale_slider_cache()
+    out = capsys.readouterr().out
+    assert "WARNING: reusing the existing latent cache" in out
+    assert str(tmp_path / "image") in out
+    assert "Clear Cache Before Training" in out

@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
 from modules.dataLoader.DropTags import DropTags
+from modules.dataLoader.LoadImage import LoadImage
 from modules.dataLoader.SliderDataModules import (
     CollectSliderPaths,
     OptionalEncodeVAE,
@@ -43,7 +44,6 @@ from mgds.pipelineModules.GetFilename import GetFilename
 from mgds.pipelineModules.ImageToVideo import ImageToVideo
 from mgds.pipelineModules.InlineAspectBatchSorting import InlineAspectBatchSorting
 from mgds.pipelineModules.InlineDistributedSampler import InlineDistributedSampler
-from mgds.pipelineModules.LoadImage import LoadImage
 from mgds.pipelineModules.LoadMultipleTexts import LoadMultipleTexts
 from mgds.pipelineModules.LoadVideo import LoadVideo
 from mgds.pipelineModules.ModifyPath import ModifyPath
