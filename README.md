@@ -1,4 +1,5 @@
 # OneTrainer
+My personal fork with vibe-coded slider LoRA support. Some features might be broken.
 
 OneTrainer is a one-stop solution for all your Diffusion training needs.
 
