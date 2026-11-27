@@ -2,6 +2,7 @@ import os
 import re
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.LoadImage import LoadImage
 from modules.model.StableDiffusionModel import StableDiffusionModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory, path_util
@@ -19,7 +20,6 @@ from mgds.pipelineModules.DecodeVAE import DecodeVAE
 from mgds.pipelineModules.DiskCache import DiskCache
 from mgds.pipelineModules.EncodeVAE import EncodeVAE
 from mgds.pipelineModules.InlineAspectBatchSorting import InlineAspectBatchSorting
-from mgds.pipelineModules.LoadImage import LoadImage
 from mgds.pipelineModules.ModifyPath import ModifyPath
 from mgds.pipelineModules.RandomBrightness import RandomBrightness
 from mgds.pipelineModules.RandomContrast import RandomContrast

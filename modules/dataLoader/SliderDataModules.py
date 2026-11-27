@@ -1,6 +1,7 @@
 import os
 import time
 
+from modules.dataLoader.LoadImage import LoadImage
 from modules.dataLoader.wuerstchen.EncodeWuerstchenEffnet import EncodeWuerstchenEffnet
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.slider_util import log_slider_scan_result, scan_slider_pairs
@@ -9,7 +10,6 @@ from mgds.PipelineModule import PipelineModule
 from mgds.pipelineModules.DiskCache import DiskCache
 from mgds.pipelineModules.EncodeVAE import EncodeVAE
 from mgds.pipelineModules.ImageToVideo import ImageToVideo
-from mgds.pipelineModules.LoadImage import LoadImage
 from mgds.pipelineModules.LoadVideo import LoadVideo
 from mgds.pipelineModules.NormalizeImageChannels import NormalizeImageChannels
 from mgds.pipelineModules.RescaleImageChannels import RescaleImageChannels
